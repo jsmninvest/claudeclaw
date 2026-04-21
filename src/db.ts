@@ -270,6 +270,25 @@ function createSchema(database: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_audit_agent ON audit_log(agent_id, created_at DESC);
 
+    -- RAG ingest bookkeeping. One row per ingest run so long-running pipelines
+    -- (e.g. C21 lender email scanner) can checkpoint per batch and resume
+    -- across 30-min watchdog windows via --resume RUN_ID. last_email_id
+    -- is the most recently successful email id so resume skips past it.
+    CREATE TABLE IF NOT EXISTS rag_ingest_runs (
+      run_id         TEXT PRIMARY KEY,
+      started_at     INTEGER NOT NULL,
+      completed_at   INTEGER,
+      namespace      TEXT,
+      emails_seen    INTEGER NOT NULL DEFAULT 0,
+      emails_kept    INTEGER NOT NULL DEFAULT 0,
+      emails_skipped INTEGER NOT NULL DEFAULT 0,
+      errors         INTEGER NOT NULL DEFAULT 0,
+      last_email_id  TEXT,
+      status         TEXT NOT NULL DEFAULT 'running'
+    );
+    CREATE INDEX IF NOT EXISTS idx_rag_ingest_status
+      ON rag_ingest_runs(status, started_at DESC);
+
     CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
       summary,
       raw_text,
@@ -2380,6 +2399,77 @@ export function getKanbanAssignments(): Record<string, KanbanAssignment> {
   }
 
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// RAG ingest runs — checkpoint/resume bookkeeping for long-running ingest
+// pipelines (e.g. the C21 lender email scanner). Each row represents one run;
+// the scanner writes progress after every batch so --resume <run_id> can pick
+// up where the previous window left off.
+// ---------------------------------------------------------------------------
+export interface RagIngestRun {
+  run_id: string;
+  started_at: number;
+  completed_at: number | null;
+  namespace: string | null;
+  emails_seen: number;
+  emails_kept: number;
+  emails_skipped: number;
+  errors: number;
+  last_email_id: string | null;
+  status: 'running' | 'completed' | 'failed' | 'partial';
+}
+
+export function createRagIngestRun(
+  runId: string,
+  namespace: string | null,
+  startedAt: number = Math.floor(Date.now() / 1000),
+): void {
+  db.prepare(`
+    INSERT INTO rag_ingest_runs
+      (run_id, started_at, namespace, status)
+    VALUES (?, ?, ?, 'running')
+  `).run(runId, startedAt, namespace);
+}
+
+export function updateRagIngestProgress(
+  runId: string,
+  patch: Partial<Pick<
+    RagIngestRun,
+    'emails_seen' | 'emails_kept' | 'emails_skipped' | 'errors' | 'last_email_id'
+  >>,
+): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+  for (const [key, val] of Object.entries(patch)) {
+    if (val === undefined) continue;
+    fields.push(`${key} = ?`);
+    values.push(val);
+  }
+  if (fields.length === 0) return;
+  values.push(runId);
+  db
+    .prepare(`UPDATE rag_ingest_runs SET ${fields.join(', ')} WHERE run_id = ?`)
+    .run(...values);
+}
+
+export function finishRagIngestRun(
+  runId: string,
+  status: 'completed' | 'failed' | 'partial',
+  completedAt: number = Math.floor(Date.now() / 1000),
+): void {
+  db.prepare(`
+    UPDATE rag_ingest_runs
+    SET status = ?, completed_at = ?
+    WHERE run_id = ?
+  `).run(status, completedAt, runId);
+}
+
+export function getRagIngestRun(runId: string): RagIngestRun | null {
+  const row = db
+    .prepare(`SELECT * FROM rag_ingest_runs WHERE run_id = ?`)
+    .get(runId) as RagIngestRun | undefined;
+  return row ?? null;
 }
 
 // Mirrors dispatcher anti-idle-check.mjs heading detection.
