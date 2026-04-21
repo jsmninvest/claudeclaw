@@ -5,8 +5,14 @@
  *   1. Failed missions (last 24h) that haven't been escalated.
  *   2. Stuck missions: status='running' for > 1 hour.
  *   3. Failed scheduled_tasks (last 1h): last_status='failed' OR last_result
- *      contains "Failed"/"Error", with a 1-hour de-dupe window so a cron that
- *      fails every 10 min doesn't spam triage missions.
+ *      contains a real error shape (Error:, FATAL, Exception, Traceback, or
+ *      a non-zero "Failed: N" count). A 1-hour de-dupe window keeps a cron
+ *      that fails every 10 min from spamming triage missions.
+ *
+ *      Why the shape check: healthy pretty-printed output like
+ *      "Jobs Failed:     0" used to match a naive LIKE '%Failed%' and
+ *      trigger false escalations. The patterns below require a non-zero
+ *      digit or an explicit error prefix to avoid that.
  *
  * Escalation = create a priority-9 mission on @main (NOT a Telegram ping).
  * Main owns the triage → dispatches a reduced-scope muscle fix to the right
@@ -24,6 +30,33 @@ import { logger } from './logger.js';
 import { createAutoTriageMission } from './auto-triage.js';
 
 const SCHEDULED_TASK_DEDUP_SECONDS = 3600; // 1 hour
+
+/**
+ * SQL predicate used to decide whether a scheduled_task run should be
+ * treated as a failure worth escalating. Exported so the unit test can
+ * feed real rows through the same clause the watchdog uses.
+ *
+ * - `last_status = 'failed'` is the primary signal (set by the scheduler).
+ * - The content checks guard against silent failures where a worker wrote
+ *   an error to last_result but never flipped last_status. We only match
+ *   real error shapes:
+ *     * `Failed: [1-9]`   — non-zero failure count (via GLOB character class).
+ *                           Healthy summaries like "Jobs Failed:     0" do
+ *                           NOT match because the char after the single space
+ *                           must be in [1-9].
+ *     * `Error:`          — typical error prefix (LIKE is ASCII-case-insensitive).
+ *     * `FATAL`           — log-level marker.
+ *     * `Exception`       — thrown/raised exception in output.
+ *     * `Traceback`       — Python-style stack trace.
+ */
+export const SCHEDULED_TASK_FAILURE_CLAUSE = `(
+  last_status = 'failed'
+  OR last_result GLOB '*Failed: [1-9]*'
+  OR last_result LIKE '%Error:%'
+  OR last_result LIKE '%FATAL%'
+  OR last_result LIKE '%Exception%'
+  OR last_result LIKE '%Traceback%'
+)`;
 
 interface FailedMissionRow {
   id: string;
@@ -181,11 +214,7 @@ export async function runMissionWatchdog(): Promise<WatchdogResult> {
              FROM scheduled_tasks
             WHERE last_run IS NOT NULL
               AND last_run > strftime('%s','now','-1 hour')
-              AND (
-                last_status = 'failed'
-                OR last_result LIKE '%Failed%'
-                OR last_result LIKE '%Error%'
-              )
+              AND ${SCHEDULED_TASK_FAILURE_CLAUSE}
               AND (escalated_at IS NULL OR escalated_at < unixepoch() - ?)`,
         )
         .all(SCHEDULED_TASK_DEDUP_SECONDS) as FailedScheduledRow[];
