@@ -30,6 +30,11 @@ import { spawn } from 'node:child_process';
 import Database from 'better-sqlite3';
 import { sendAlert } from '../dist/alert-router.js';
 
+// Load .env so ALLOWED_CHAT_ID + per-agent bot tokens are available when this
+// script is spawned from a shell that didn't source .env (scheduler, Haiku
+// agent Bash tool, etc). Node 20.6+ built-in — no new dependency.
+try { process.loadEnvFile('/Users/aditya_office_ai_assistant/claudeclaw/.env'); } catch {}
+
 // ── Constants ─────────────────────────────────────────────────────
 const ROOT_DIR = '/Users/aditya_office_ai_assistant/claudeclaw';
 const DISPATCHER_SCRIPT = `${ROOT_DIR}/scripts/anti-idle-check.mjs`;

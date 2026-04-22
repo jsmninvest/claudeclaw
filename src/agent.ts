@@ -270,6 +270,13 @@ export async function runAgent(
   abortController?: AbortController,
   onStreamText?: (accumulatedText: string) => void,
   mcpAllowlist?: string[],
+  /**
+   * Per-call override for the agentic turn cap. When provided and > 0 it takes
+   * precedence over AGENT_MAX_TURNS. Use for known-expensive tasks with
+   * legitimately multi-step validation + output (e.g. DION planner). NULL /
+   * undefined / 0 falls back to AGENT_MAX_TURNS.
+   */
+  maxTurnsOverride?: number | null,
 ): Promise<AgentResult> {
   // Read secrets from .env without polluting process.env.
   // CLAUDE_CODE_OAUTH_TOKEN is optional — the subprocess finds auth via ~/.claude/
@@ -306,6 +313,25 @@ export async function runAgent(
   // Telegram's "typing..." action expires after ~5s.
   const typingInterval = setInterval(onTyping, 4000);
 
+  // Grace window after the SDK emits a `result` event. Some long Opus runs with
+  // multiple MCP servers (ghl-mcp-server in particular) never close the async
+  // iterable after result — the for-await hangs on the next `.next()` call until
+  // the outer turn timeout fires (~30 min). We force-exit the loop this many ms
+  // after result so the turn resolves promptly with the captured resultText.
+  // Override with AGENT_STREAM_GRACE_MS (used by tests).
+  const graceMs = Math.max(
+    0,
+    parseInt(process.env.AGENT_STREAM_GRACE_MS ?? '5000', 10),
+  );
+
+  // Force-exit signal fired by the grace timer after result
+  let forceExitAfterResult = false;
+  let resolveForceExit: (() => void) | null = null;
+  const forceExitPromise = new Promise<void>((resolve) => {
+    resolveForceExit = resolve;
+  });
+  let graceTimer: ReturnType<typeof setTimeout> | null = null;
+
   try {
     // Load MCP servers from project + user settings files, filtered by agent allowlist
     const mcpServers = loadMcpServers(mcpAllowlist);
@@ -318,7 +344,11 @@ export async function runAgent(
     // SDK Options.mcpServers expects Record<string, McpServerConfig>
     const mcpServerSpecs = mcpServerNames.length > 0 ? mcpServers : undefined;
 
-    for await (const event of query({
+    // We manually iterate the async iterable (instead of `for await`) so we
+    // can race `.next()` against the post-result grace timer. If the SDK
+    // stream stalls after the `result` event, the race lets us break free
+    // instead of waiting forever on `.next()`.
+    const stream = query({
       prompt: singleTurn(message),
       options: {
         // cwd = agent directory (if running as agent) or project root.
@@ -336,8 +366,17 @@ export async function runAgent(
         allowDangerouslySkipPermissions: true,
 
         // Cap agentic turns to prevent runaway tool-use loops (e.g. retrying
-        // stale cookies 40+ times). Configurable via AGENT_MAX_TURNS in .env.
-        ...(AGENT_MAX_TURNS > 0 ? { maxTurns: AGENT_MAX_TURNS } : {}),
+        // stale cookies 40+ times). Default from AGENT_MAX_TURNS in .env;
+        // per-call override via maxTurnsOverride (set by scheduler from
+        // scheduled_tasks.max_turns / mission_tasks.max_turns). Override > 0
+        // wins over the env default; null/undefined/0 falls back.
+        ...(
+          maxTurnsOverride && maxTurnsOverride > 0
+            ? { maxTurns: maxTurnsOverride }
+            : AGENT_MAX_TURNS > 0
+              ? { maxTurns: AGENT_MAX_TURNS }
+              : {}
+        ),
 
         // Pass secrets to the subprocess without polluting our own process.env
         env: sdkEnv,
@@ -354,8 +393,43 @@ export async function runAgent(
         // Abort support — signals the SDK to kill the subprocess
         ...(abortController ? { abortController } : {}),
       },
-    })) {
-      const ev = event as Record<string, unknown>;
+    });
+
+    const iterator = stream[Symbol.asyncIterator]();
+    while (true) {
+      // Race the next event against the post-result force-exit signal.
+      // Before result: forceExitPromise is pending, so this resolves on the
+      // next event (or end of stream). After result: the grace timer fires
+      // forceExitPromise, unblocking us even if the SDK never closes the
+      // iterator.
+      const outcome = await Promise.race([
+        iterator.next().then((r) => ({ kind: 'event' as const, r })),
+        forceExitPromise.then(() => ({ kind: 'force-exit' as const })),
+      ]);
+
+      if (outcome.kind === 'force-exit') {
+        logger.warn(
+          { graceMs },
+          'Stream did not close after result; forcing exit',
+        );
+        // Best-effort cleanup — tell the SDK to release the subprocess/stream.
+        // IMPORTANT: do NOT await iterator.return(). If the SDK's async
+        // generator is suspended at an `await` that never resolves (exactly
+        // the hang we're fixing), awaiting return() will itself hang. Fire
+        // and forget; swallow any rejection so it doesn't become unhandled.
+        try {
+          const ret = iterator.return?.(undefined);
+          if (ret && typeof (ret as Promise<unknown>).catch === 'function') {
+            (ret as Promise<unknown>).catch(() => {});
+          }
+        } catch {
+          // ignore — we've already captured resultText + usage
+        }
+        break;
+      }
+
+      if (outcome.r.done) break;
+      const ev = outcome.r.value as Record<string, unknown>;
 
       if (ev['type'] === 'system' && ev['subtype'] === 'init') {
         newSessionId = ev['session_id'] as string;
@@ -473,6 +547,21 @@ export async function runAgent(
           { hasResult: !!resultText, subtype: ev['subtype'] },
           'Agent result received',
         );
+
+        // Arm the grace timer. Post-result events (tool_result tails, MCP
+        // teardown, etc.) are welcome to arrive within `graceMs`, but we will
+        // not wait on `.next()` longer than that. Prevents the 24-min hang
+        // observed on Opus + ghl-mcp-server multi-tool runs.
+        if (graceTimer === null) {
+          graceTimer = setTimeout(() => {
+            forceExitAfterResult = true;
+            resolveForceExit?.();
+          }, graceMs);
+          // Don't keep the event loop alive just for this timer.
+          if (typeof graceTimer === 'object' && graceTimer && 'unref' in graceTimer) {
+            (graceTimer as { unref: () => void }).unref();
+          }
+        }
       }
     }
   } catch (err) {
@@ -483,7 +572,12 @@ export async function runAgent(
     throw err;
   } finally {
     clearInterval(typingInterval);
+    if (graceTimer !== null) clearTimeout(graceTimer);
   }
 
+  // Note: when forceExitAfterResult is true, resultText + usage were already
+  // captured from the `result` event before the grace timer fired. We return
+  // them as a successful turn — the agent's work completed, the stream tail
+  // just never closed. Not marking `aborted`.
   return { text: resultText, newSessionId, usage };
 }

@@ -5,8 +5,14 @@
  *   1. Failed missions (last 24h) that haven't been escalated.
  *   2. Stuck missions: status='running' for > 1 hour.
  *   3. Failed scheduled_tasks (last 1h): last_status='failed' OR last_result
- *      contains "Failed"/"Error", with a 1-hour de-dupe window so a cron that
- *      fails every 10 min doesn't spam triage missions.
+ *      contains a real error shape (Error:, FATAL, Exception, Traceback, or
+ *      a non-zero "Failed: N" count). A 1-hour de-dupe window keeps a cron
+ *      that fails every 10 min from spamming triage missions.
+ *
+ *      Why the shape check: healthy pretty-printed output like
+ *      "Jobs Failed:     0" used to match a naive LIKE '%Failed%' and
+ *      trigger false escalations. The patterns below require a non-zero
+ *      digit or an explicit error prefix to avoid that.
  *
  * Escalation = create a priority-9 mission on @main (NOT a Telegram ping).
  * Main owns the triage → dispatches a reduced-scope muscle fix to the right
@@ -22,8 +28,60 @@ import path from 'path';
 import { STORE_DIR } from './config.js';
 import { logger } from './logger.js';
 import { createAutoTriageMission } from './auto-triage.js';
+import { createRetryMission, logToHiveMind, RetryReason } from './db.js';
+import { notifyRetryDispatch } from './mission-autopush.js';
 
 const SCHEDULED_TASK_DEDUP_SECONDS = 3600; // 1 hour
+
+/**
+ * SQL predicate used to decide whether a scheduled_task run should be
+ * treated as a failure worth escalating. Exported so the unit test can
+ * feed real rows through the same clause the watchdog uses.
+ *
+ * - `last_status = 'failed'` is the primary signal (set by the scheduler).
+ * - The content checks guard against silent failures where a worker wrote
+ *   an error to last_result but never flipped last_status. We only match
+ *   real error shapes — never bare words like "error" or "failed" that
+ *   show up in healthy summaries:
+ *     * `Failed: [1-9]`   — non-zero failure count (via GLOB character class).
+ *                           Healthy summaries like "Jobs Failed:     0" do
+ *                           NOT match because the char after the single space
+ *                           must be in [1-9].
+ *     * `Error:`          — typical error prefix (LIKE is ASCII-case-insensitive).
+ *     * `FATAL`           — log-level marker.
+ *     * `Exception`       — thrown/raised exception in output.
+ *     * `Traceback`       — Python-style stack trace.
+ *     * `"ok":false`      — JSON fail-closed payload shape. Added 2026-04-21
+ *                           after rate-update-v1 row 83a91d04 went silent:
+ *                           the agent-layer wrapper reported ok:false JSON
+ *                           under a successful mission run (last_status='success'),
+ *                           so the status signal missed it. Matching the
+ *                           canonical JSON shape catches this even when the
+ *                           exit code is lost in translation. Same reasoning
+ *                           as `Failed: [1-9]` — we require the explicit JSON
+ *                           key, not just the word "ok" or "false".
+ *     * `"error":"`       — JSON error field shape. Matches any payload that
+ *                           builds a JSON error result (e.g. {"error":"..."}
+ *                           or {"ok":false,"error":"..."}). Requires the
+ *                           trailing quote so healthy JSON like
+ *                           {"notes":"no errors today"} does NOT match.
+ *     * `CLI failed`      — explicit CLI-failure banner used by one-shot
+ *                           wrapper scripts (e.g. mission-watchdog-cli's
+ *                           stderr line). Added 2026-04-21 after the
+ *                           watchdog itself DOA'd under launchd and the
+ *                           scheduler kept marking last_status='success'.
+ */
+export const SCHEDULED_TASK_FAILURE_CLAUSE = `(
+  last_status = 'failed'
+  OR last_result GLOB '*Failed: [1-9]*'
+  OR last_result LIKE '%Error:%'
+  OR last_result LIKE '%FATAL%'
+  OR last_result LIKE '%Exception%'
+  OR last_result LIKE '%Traceback%'
+  OR last_result LIKE '%"ok":false%'
+  OR last_result LIKE '%"error":"%'
+  OR last_result LIKE '%CLI failed%'
+)`;
 
 interface FailedMissionRow {
   id: string;
@@ -56,8 +114,34 @@ export interface WatchdogResult {
   failedEscalated: number;
   stuckEscalated: number;
   scheduledEscalated: number;
+  /** How many obvious-transient failures (turn-cap / timeout) the watchdog
+   *  auto-retried on this tick. Separate from failedEscalated — these rows
+   *  bypass the @main triage lane entirely. */
+  autoRetried: number;
   errors: number;
   triagedMissions: string[];
+  /** IDs of the child retry missions spawned on this tick. */
+  retriedMissions: string[];
+}
+
+interface RetryCandidateRow {
+  id: string;
+  title: string;
+  assigned_agent: string | null;
+  error: string | null;
+}
+
+/**
+ * Classify the parent's error string into an auto-retry reason.
+ * Mirrors the SQL eligibility clause — anything the SQL matches, this
+ * function must classify. Returns null if the error shape isn't one of
+ * the two we retry on.
+ */
+function classifyRetryReason(error: string | null): RetryReason | null {
+  if (!error) return null;
+  if (error.includes('Reached maximum number of turns')) return 'turn_cap';
+  if (error.includes('Timed out after')) return 'timeout';
+  return null;
 }
 
 function getDb(): Database.Database {
@@ -88,11 +172,94 @@ export async function runMissionWatchdog(): Promise<WatchdogResult> {
     failedEscalated: 0,
     stuckEscalated: 0,
     scheduledEscalated: 0,
+    autoRetried: 0,
     errors: 0,
     triagedMissions: [],
+    retriedMissions: [],
   };
 
   try {
+    // ── 0. Auto-retry lane (obvious transient failures only) ─────────
+    // Hard-scoped slice of the failed-mission set that we retry ONCE
+    // without bothering @main. Eligibility is deliberately narrow:
+    //   - status='failed' AND escalated_at IS NULL (same as main lane)
+    //   - retry_attempt=0              (single-budget, hard cap)
+    //   - created_by='main'            (only Aditya-dispatched work)
+    //   - title NOT LIKE 'Auto-triage:%' (never retry watchdog meta-work)
+    //   - error matches turn-cap OR timeout shape (classifier below verifies
+    //     the exact match so the SQL clause stays readable)
+    // Everything else falls through to the existing @main triage lane.
+    //
+    // Column-existence guard: retry_attempt is added in v1.7.3. On older
+    // DBs the column is missing, so we skip the lane entirely rather than
+    // throw. Same forward-compat pattern used by the scheduled_tasks lane
+    // below for its own post-migration column.
+    if (hasColumn(db, 'mission_tasks', 'retry_attempt')) {
+      const retryCandidates = db
+        .prepare(
+          `SELECT id, title, assigned_agent, error
+             FROM mission_tasks
+            WHERE status = 'failed'
+              AND escalated_at IS NULL
+              AND retry_attempt = 0
+              AND created_by = 'main'
+              AND title NOT LIKE 'Auto-triage:%'
+              AND (
+                error LIKE '%Reached maximum number of turns%'
+                OR error LIKE '%Timed out after%'
+              )
+              AND created_at > strftime('%s','now','-24 hours')`,
+        )
+        .all() as RetryCandidateRow[];
+
+      for (const row of retryCandidates) {
+        const reason = classifyRetryReason(row.error);
+        // Belt-and-suspenders: SQL already filtered to turn-cap/timeout.
+        // If classifier disagrees, skip and let @main triage handle it.
+        if (!reason) continue;
+        try {
+          const retry = createRetryMission(row.id, reason);
+          if (!retry) {
+            // Parent disappeared or preconditions failed between SELECT and
+            // INSERT — let the regular escalation lane handle it.
+            continue;
+          }
+          // Ping Aditya out-of-band (not batched with completion pushes).
+          // Fire-and-forget: notifyRetryDispatch fall-opens on any error.
+          void notifyRetryDispatch({
+            childId: retry.childId,
+            parentId: retry.parentId,
+            assignedAgent: retry.assignedAgent,
+            title: retry.title,
+            reason: retry.reason,
+          });
+          // Log to hive_mind so the other agents see the auto-retry event
+          // alongside regular completions. Swallow DB errors here — we
+          // don't want a hive_mind write issue to undo the retry.
+          try {
+            logToHiveMind(
+              'watchdog',
+              '',
+              'mission_auto_retry',
+              `Auto-retry ${retry.childId} for ${retry.parentId}: ${reason}`,
+            );
+          } catch (err) {
+            logger.warn({ err, childId: retry.childId }, 'mission-watchdog: hive_mind log failed');
+          }
+          result.autoRetried += 1;
+          result.retriedMissions.push(retry.childId);
+        } catch (err) {
+          logger.error(
+            { err, missionId: row.id },
+            'mission-watchdog: auto-retry dispatch failed, falling through to triage',
+          );
+          result.errors += 1;
+          // Intentionally do NOT stamp escalated_at here — leaving it NULL
+          // lets the @main triage lane below pick up the row as a safety net.
+        }
+      }
+    }
+
     // ── 1. Failed missions (last 24h, not yet escalated) ──────────────
     const failedRows = db
       .prepare(
@@ -181,11 +348,7 @@ export async function runMissionWatchdog(): Promise<WatchdogResult> {
              FROM scheduled_tasks
             WHERE last_run IS NOT NULL
               AND last_run > strftime('%s','now','-1 hour')
-              AND (
-                last_status = 'failed'
-                OR last_result LIKE '%Failed%'
-                OR last_result LIKE '%Error%'
-              )
+              AND ${SCHEDULED_TASK_FAILURE_CLAUSE}
               AND (escalated_at IS NULL OR escalated_at < unixepoch() - ?)`,
         )
         .all(SCHEDULED_TASK_DEDUP_SECONDS) as FailedScheduledRow[];
@@ -195,9 +358,29 @@ export async function runMissionWatchdog(): Promise<WatchdogResult> {
       );
 
       for (const row of failedScheduled) {
+        // Defensive coercion: scheduled_tasks.prompt is declared TEXT but
+        // SQLite's dynamic typing lets BLOBs slip in (seen in 264aeba5 where
+        // a Buffer got written). Buffer.split() throws, so coerce every
+        // text-ish column we downstream-consume.
+        const promptStr =
+          typeof row.prompt === 'string'
+            ? row.prompt
+            : row.prompt == null
+              ? ''
+              : Buffer.isBuffer(row.prompt)
+                ? (row.prompt as Buffer).toString('utf8')
+                : String(row.prompt);
+        const lastResultStr =
+          typeof row.last_result === 'string'
+            ? row.last_result
+            : row.last_result == null
+              ? null
+              : Buffer.isBuffer(row.last_result)
+                ? (row.last_result as Buffer).toString('utf8')
+                : String(row.last_result);
         // Derive a usable title from the first line of the prompt — scheduled_tasks
         // don't have a dedicated title column.
-        const firstLine = (row.prompt || '').split('\n')[0].trim();
+        const firstLine = (promptStr || '').split('\n')[0].trim();
         const title = firstLine.length > 100 ? firstLine.slice(0, 99) + '…' : firstLine;
         const errBlurb =
           row.last_status === 'failed'
@@ -210,9 +393,9 @@ export async function runMissionWatchdog(): Promise<WatchdogResult> {
             title: title || `scheduled_task ${row.id}`,
             assignedAgent: row.agent_id,
             schedule: row.schedule,
-            prompt: row.prompt,
+            prompt: promptStr,
             error: errBlurb + ` (last_run=${row.last_run})`,
-            lastOutput: row.last_result,
+            lastOutput: lastResultStr,
           });
           stampScheduled.run(row.id);
           result.scheduledEscalated += 1;

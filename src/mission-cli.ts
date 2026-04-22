@@ -54,12 +54,28 @@ const acceptanceArg = acceptanceFlagIdx !== -1
   ? process.argv[acceptanceFlagIdx + 1] ?? null
   : null;
 
+// Parse --max-turns flag (optional per-task turn-cap override).
+// NULL = fall back to AGENT_MAX_TURNS env default (currently 60). Non-null
+// lifts the cap for known-expensive missions without raising the global
+// default for ad-hoc throwaway work. Mirrors schedule-cli.ts.
+const maxTurnsFlagIdx = process.argv.indexOf('--max-turns');
+let cliMaxTurns: number | null = null;
+if (maxTurnsFlagIdx !== -1) {
+  const raw = process.argv[maxTurnsFlagIdx + 1];
+  const parsed = parseInt(raw ?? '', 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.error(`--max-turns requires a positive integer. Got: ${raw}`);
+    process.exit(1);
+  }
+  cliMaxTurns = parsed;
+}
+
 // Who created this task
 const createdBy = process.env.CLAUDECLAW_AGENT_ID ?? 'main';
 
 // Clean argv: remove all flag pairs
 const flagIndices = new Set<number>();
-[agentFlagIdx, titleFlagIdx, statusFlagIdx, priorityFlagIdx, acceptanceFlagIdx].forEach(idx => {
+[agentFlagIdx, titleFlagIdx, statusFlagIdx, priorityFlagIdx, acceptanceFlagIdx, maxTurnsFlagIdx].forEach(idx => {
   if (idx !== -1) { flagIndices.add(idx); flagIndices.add(idx + 1); }
 });
 const cleanedArgv = process.argv.filter((_, i) => !flagIndices.has(i));
@@ -77,12 +93,25 @@ switch (command) {
   case 'create': {
     const prompt = rest[0];
     if (!prompt) {
-      console.error('Usage: mission-cli create --agent <id> --title "Label" "Full prompt text"');
+      console.error('Usage: mission-cli create --agent <id> --title "Label" [--max-turns N] "Full prompt text"');
+      console.error('  --max-turns: per-task turn cap override (e.g. --max-turns 120). ' +
+        'Defaults to AGENT_MAX_TURNS env var.');
       process.exit(1);
     }
     const title = titleArg || prompt.slice(0, 60);
     const id = randomBytes(4).toString('hex');
-    createMissionTask(id, title, prompt, targetAgent ?? null, createdBy, priorityArg, acceptanceArg);
+    // Preserve existing timeout_ms default (null) while adding max_turns override.
+    createMissionTask(
+      id,
+      title,
+      prompt,
+      targetAgent ?? null,
+      createdBy,
+      priorityArg,
+      acceptanceArg,
+      null,
+      cliMaxTurns,
+    );
 
     console.log(`Mission task created: ${id}`);
     console.log(`  Title:    ${title}`);
@@ -91,6 +120,9 @@ switch (command) {
     console.log(`  Prompt:   ${prompt.slice(0, 100)}${prompt.length > 100 ? '...' : ''}`);
     if (acceptanceArg) {
       console.log(`  Accept:   ${acceptanceArg.slice(0, 100)}${acceptanceArg.length > 100 ? '...' : ''}`);
+    }
+    if (cliMaxTurns) {
+      console.log(`  MaxTurns: ${cliMaxTurns}`);
     }
     break;
   }

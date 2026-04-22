@@ -38,10 +38,27 @@ const cliAgentId = agentFlagIdx !== -1
 const modelFlagIdx = process.argv.indexOf('--model');
 const cliModelRaw = modelFlagIdx !== -1 ? process.argv[modelFlagIdx + 1] ?? null : null;
 
-// Remove --agent, --model, and their values from rest args
+// Parse --max-turns flag (optional per-task turn-cap override).
+// NULL = fall back to AGENT_MAX_TURNS env default (currently 60). Non-null
+// lifts the cap for known-expensive tasks (e.g. DION planner) without
+// raising the global default for ad-hoc throwaway work.
+const maxTurnsFlagIdx = process.argv.indexOf('--max-turns');
+let cliMaxTurns: number | null = null;
+if (maxTurnsFlagIdx !== -1) {
+  const raw = process.argv[maxTurnsFlagIdx + 1];
+  const parsed = parseInt(raw ?? '', 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.error(`--max-turns requires a positive integer. Got: ${raw}`);
+    process.exit(1);
+  }
+  cliMaxTurns = parsed;
+}
+
+// Remove --agent, --model, --max-turns and their values from rest args
 const cleanedArgv = process.argv.filter((_, i) => {
   if (agentFlagIdx !== -1 && (i === agentFlagIdx || i === agentFlagIdx + 1)) return false;
   if (modelFlagIdx !== -1 && (i === modelFlagIdx || i === modelFlagIdx + 1)) return false;
+  if (maxTurnsFlagIdx !== -1 && (i === maxTurnsFlagIdx || i === maxTurnsFlagIdx + 1)) return false;
   return true;
 });
 
@@ -72,8 +89,10 @@ switch (command) {
     const cron = rest[1];
 
     if (!prompt || !cron) {
-      console.error('Usage: schedule-cli create "prompt" "cron expression" [--model haiku|sonnet|opus]');
+      console.error('Usage: schedule-cli create "prompt" "cron expression" [--model haiku|sonnet|opus] [--max-turns N]');
       console.error('Example: schedule-cli create "Summarise AI news" "0 9 * * 1" --model sonnet');
+      console.error('  --max-turns: per-task turn cap override (e.g. --max-turns 120). ' +
+        'Defaults to AGENT_MAX_TURNS env var.');
       process.exit(1);
     }
 
@@ -87,7 +106,7 @@ switch (command) {
     }
 
     const id = randomBytes(4).toString('hex');
-    createScheduledTask(id, prompt, cron, nextRun, cliAgentId, cliModelRaw);
+    createScheduledTask(id, prompt, cron, nextRun, cliAgentId, cliModelRaw, cliMaxTurns);
 
     console.log(`Task created: ${id}`);
     console.log(`Agent:        ${cliAgentId}`);
@@ -95,6 +114,7 @@ switch (command) {
     console.log(`Prompt:       ${prompt}`);
     console.log(`Schedule:     ${cron}`);
     console.log(`Next run:     ${formatDate(nextRun)}`);
+    console.log(`Max turns:    ${cliMaxTurns ?? '(env default)'}`);
     break;
   }
 

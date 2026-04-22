@@ -79,8 +79,14 @@ Steps:
 1. Read STAGE_A_FACTS from {{CONTACT_ID}}. Key fields: loan_purpose,
    income_type, credit_score_self_reported, property_type,
    property_value_estimate, requested_loan_amount.
-2. Pinecone shortlist: query the loan-atlas index with a concise
-   natural-language query from the facts above. Pull top 10.
+2. loan-atlas shortlist: do NOT use the Pinecone MCP — the index has
+   no integrated inference and will error. Use the client-side helper
+   instead. Either:
+     - CLI:  node scripts/loan-atlas-search.mjs "[your query]"
+                --namespace lender-programs --topK 10 --json
+     - Or import searchLoanAtlas() from src/loan-atlas-rag.ts
+   Build a concise natural-language query from the Stage A facts
+   (loan_purpose, income_type, credit, property_type) and pull top 10.
 3. Rule-based rerank against JSMN lender matrix:
      - income_type in (1099, self_employed) AND credit >= 660
        -> boost Non-QM bank statement programs.
@@ -209,6 +215,14 @@ export const STAGE_D: StagePrompt = {
 export const STAGE_REGISTRY: Record<StageId, StagePrompt> = {
   A: STAGE_A, B: STAGE_B, C: STAGE_C, D: STAGE_D,
 };
+
+/**
+ * Alias — canonical name the call-worker and downstream callers use to
+ * refer to the Stage A prompt bundle. Keeps naming aligned with the
+ * "one STAGE_X_PROMPT per stage" contract, while the richer StagePrompt
+ * object is what gets passed through buildPrompt / mission-cli.
+ */
+export const STAGE_A_PROMPT = STAGE_A;
 
 /** Substitute {{CONTACT_ID}} etc. into a template. */
 export function buildPrompt(
