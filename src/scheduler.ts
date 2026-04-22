@@ -12,6 +12,7 @@ import {
   claimNextMissionTask,
   completeMissionTask,
   resetStuckMissionTasks,
+  getCallPipelineRun,
 } from './db.js';
 import { logger } from './logger.js';
 import { messageQueue } from './message-queue.js';
@@ -19,6 +20,8 @@ import { runAgent } from './agent.js';
 import { formatForTelegram } from './bot.js';
 import { emitChatEvent } from './state.js';
 import { sendAlert } from './alert-router.js';
+import { onStageAccepted } from './call-pipeline/orchestrator.js';
+import type { StageId } from './call-pipeline/stage-prompts.js';
 
 type Sender = (text: string) => Promise<void>;
 
@@ -253,6 +256,20 @@ async function runDueMissionTasks(): Promise<void> {
         if (finalStatus === 'completed') {
           completeMissionTask(mission.id, text, 'completed');
           logger.info({ missionId: mission.id, acceptance: hasAcceptance ? 'pass' : 'n/a' }, 'Mission task completed');
+
+          // Call pipeline auto-advance hook. When a Stage A/B/C/D mission
+          // passes acceptance, mark the stage completed and spawn the next
+          // stage. The orchestrator already implements this — scheduler
+          // just has to invoke it. Detection is title-based (see router
+          // below); callMsgId is parsed from the STAGE_X_DONE line in the
+          // agent's final output. Failures in the hook are logged and
+          // swallowed so they never bubble up and kill the mission run.
+          try {
+            advanceCallPipeline(mission.title, text);
+          } catch (err) {
+            logger.warn({ err, missionId: mission.id, title: mission.title }, 'call-pipeline advance hook threw');
+          }
+
           await sendAlert({
             agentId: mission.assigned_agent || schedulerAgentId,
             chatId,
@@ -326,6 +343,74 @@ function parseAcceptanceVerdict(
     return { kind: 'fail', reason };
   }
   return { kind: 'missing' };
+}
+
+/**
+ * Detect which call-pipeline stage a mission title belongs to, if any.
+ * Stage A uses a prefix match because the clawd call-transcript-worker
+ * sets titles like "Call pipeline Stage A: [contact name]", whereas
+ * Stages B/C/D are created by the orchestrator itself with fixed titles.
+ * Returns null for non-pipeline missions.
+ */
+function detectPipelineStage(title: string): StageId | null {
+  if (!title) return null;
+  if (title.startsWith('Call pipeline Stage A:')) return 'A';
+  if (title === 'Call pipeline B: loan product RAG') return 'B';
+  if (title === 'Call pipeline C: borrower email draft') return 'C';
+  if (title === 'Call pipeline D: AE desk draft') return 'D';
+  return null;
+}
+
+/**
+ * Parse the "STAGE_X_DONE call_msg_id=..." line from a mission's final
+ * result text. Returns null if the token is missing or malformed.
+ */
+function extractCallMsgId(text: string): string | null {
+  if (!text) return null;
+  const m = /STAGE_[A-D]_DONE\s+call_msg_id=(\S+)/.exec(text);
+  return m ? m[1] : null;
+}
+
+/**
+ * Call-pipeline auto-advance. Fires after a Stage A/B/C/D mission has
+ * completed acceptance. Marks the current stage completed in
+ * call_pipeline_runs and spawns the next stage mission via the
+ * orchestrator. Never throws.
+ */
+export function advanceCallPipeline(missionTitle: string, resultText: string): void {
+  const stage = detectPipelineStage(missionTitle);
+  if (!stage) return;
+
+  const callMsgId = extractCallMsgId(resultText);
+  if (!callMsgId) {
+    logger.warn({ missionTitle }, 'call-pipeline: STAGE_X_DONE call_msg_id missing from result, skipping advance');
+    return;
+  }
+
+  const run = getCallPipelineRun(callMsgId, stage);
+  if (!run) {
+    logger.warn({ callMsgId, stage, missionTitle }, 'call-pipeline: no call_pipeline_runs row found, skipping advance');
+    return;
+  }
+
+  try {
+    const res = onStageAccepted(
+      { callMsgId, contactId: run.contact_id, ghlConvId: run.ghl_conv_id },
+      stage,
+    );
+    logger.info(
+      {
+        callMsgId,
+        acceptedStage: stage,
+        nextStage: res?.stage ?? null,
+        nextMissionId: res?.missionId ?? null,
+        skipped: res?.skipped ?? null,
+      },
+      'call-pipeline: stage advanced',
+    );
+  } catch (err) {
+    logger.warn({ err, callMsgId, stage }, 'call-pipeline: onStageAccepted failed');
+  }
 }
 
 export function computeNextRun(cronExpression: string): number {
