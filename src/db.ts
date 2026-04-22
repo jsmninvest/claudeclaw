@@ -229,11 +229,23 @@ function createSchema(database: Database.Database): void {
       created_at          INTEGER NOT NULL,
       started_at          INTEGER,
       completed_at        INTEGER,
-      acceptance_criteria TEXT
+      acceptance_criteria TEXT,
+      timeout_ms          INTEGER,
+      autopushed_at       INTEGER,
+      escalated_at        INTEGER,
+      retry_attempt       INTEGER NOT NULL DEFAULT 0,
+      retried_from        TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_mission_status
       ON mission_tasks(assigned_agent, status, priority DESC, created_at ASC);
+
+    -- Partial index on failed+not-yet-retried rows — scoped tight so the
+    -- watchdog auto-retry lane (src/mission-watchdog.ts) stays O(candidates)
+    -- instead of scanning all history.
+    CREATE INDEX IF NOT EXISTS idx_mission_retry_candidates
+      ON mission_tasks(status, retry_attempt)
+      WHERE status = 'failed' AND retry_attempt = 0;
 
     -- Call pipeline durability: one row per (call_msg_id, stage) so each
     -- of the 4 stages (A→D) in the post-call pipeline has independent
@@ -583,6 +595,48 @@ function runMigrations(database: Database.Database): void {
     database.exec(`ALTER TABLE mission_tasks ADD COLUMN acceptance_criteria TEXT`);
     logger.info('Migration: added acceptance_criteria column to mission_tasks');
   }
+
+  // Mission Control: add timeout_ms column for per-task agent-turn timeout override (v1.7.1).
+  // NULL means "use default" — the scheduler falls back to AGENT_TURN_TIMEOUT_MS env var,
+  // and ultimately to the hardcoded 10-minute default in orchestrator.ts.
+  if (!missionColsPost.some((c) => c.name === 'timeout_ms')) {
+    database.exec(`ALTER TABLE mission_tasks ADD COLUMN timeout_ms INTEGER`);
+    logger.info('Migration: added timeout_ms column to mission_tasks');
+  }
+
+  // Mission Control: add autopushed_at column for Telegram auto-notification
+  // idempotency (v1.7.2). When a mission completes or fails and was
+  // created_by='main' (i.e. Rudy queued it on Aditya's behalf), the
+  // mission-autopush module claims the row by CAS-stamping this column —
+  // ensuring the completion pings Telegram exactly once even if the hook
+  // runs twice. NULL = not yet pushed. See src/mission-autopush.ts.
+  if (!missionColsPost.some((c) => c.name === 'autopushed_at')) {
+    database.exec(`ALTER TABLE mission_tasks ADD COLUMN autopushed_at INTEGER`);
+    logger.info('Migration: added autopushed_at column to mission_tasks');
+  }
+
+  // Mission Control: auto-retry bookkeeping (v1.7.3). Watchdog uses these
+  // columns to run a single-budget auto-retry lane for obvious transient
+  // failures (turn-cap / timeout). retry_attempt: 0 = original, 1 = first
+  // auto-retry (hard cap). retried_from: pointer back to the parent failed
+  // mission. See src/mission-watchdog.ts + src/db.ts createRetryMission().
+  if (!missionColsPost.some((c) => c.name === 'retry_attempt')) {
+    database.exec(
+      `ALTER TABLE mission_tasks ADD COLUMN retry_attempt INTEGER NOT NULL DEFAULT 0`,
+    );
+    logger.info('Migration: added retry_attempt column to mission_tasks');
+  }
+  if (!missionColsPost.some((c) => c.name === 'retried_from')) {
+    database.exec(`ALTER TABLE mission_tasks ADD COLUMN retried_from TEXT`);
+    logger.info('Migration: added retried_from column to mission_tasks');
+  }
+  // Partial index scoped to failed+not-retried rows — matches the watchdog's
+  // candidate query exactly. IF NOT EXISTS keeps this idempotent.
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS idx_mission_retry_candidates
+      ON mission_tasks(status, retry_attempt)
+      WHERE status = 'failed' AND retry_attempt = 0;
+  `);
 
   // Call Pipeline: ensure call_pipeline_runs exists on legacy DBs. createSchema
   // covers fresh installs; this branch is for DBs created before this feature
@@ -1885,6 +1939,18 @@ export interface MissionTask {
   started_at: number | null;
   completed_at: number | null;
   acceptance_criteria: string | null;
+  /** Per-task agent-turn timeout in ms. NULL = use AGENT_TURN_TIMEOUT_MS env default. */
+  timeout_ms: number | null;
+  /** Unix ts when the mission-autopush hook fired Telegram notification.
+   *  NULL = not yet pushed. Used as an atomic CAS claim so we never double-fire. */
+  autopushed_at: number | null;
+  /** Auto-retry attempt counter. 0 = original mission, 1 = first (and only)
+   *  auto-retry spawned by the mission-watchdog retry lane. Hard-capped at 1
+   *  so we never loop. See src/mission-watchdog.ts. */
+  retry_attempt: number;
+  /** Pointer back to the parent mission id when this row IS an auto-retry.
+   *  NULL on every original mission. Used for audit + test assertions. */
+  retried_from: string | null;
 }
 
 export function createMissionTask(
@@ -1895,12 +1961,13 @@ export function createMissionTask(
   createdBy = 'dashboard',
   priority = 0,
   acceptanceCriteria: string | null = null,
+  timeoutMs: number | null = null,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO mission_tasks (id, title, prompt, assigned_agent, status, created_by, priority, created_at, acceptance_criteria)
-     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
-  ).run(id, title, prompt, assignedAgent, createdBy, priority, now, acceptanceCriteria);
+    `INSERT INTO mission_tasks (id, title, prompt, assigned_agent, status, created_by, priority, created_at, acceptance_criteria, timeout_ms)
+     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`,
+  ).run(id, title, prompt, assignedAgent, createdBy, priority, now, acceptanceCriteria, timeoutMs);
 }
 
 export function getUnassignedMissionTasks(): MissionTask[] {
@@ -2023,6 +2090,127 @@ export function resetStuckMissionTasks(agentId: string): number {
     `UPDATE mission_tasks SET status = 'queued', started_at = NULL WHERE status = 'running' AND assigned_agent = ?`,
   ).run(agentId);
   return result.changes;
+}
+
+/**
+ * Atomically claim a mission for Telegram autopush notification.
+ *
+ * Stamps autopushed_at with the current unix timestamp IFF it's currently NULL.
+ * Returns true on the first claim, false on every subsequent call for the same
+ * mission — this is how the mission-autopush hook guarantees exactly-once
+ * notification even if the scheduler completion path is re-entered (e.g. a
+ * watchdog-stamped escalated_at re-fires the same id through the hook).
+ *
+ * Idempotent by design: safe to call on any mission id, including non-existent
+ * ones (returns false) and already-pushed ones (returns false).
+ */
+export function markMissionAutopushed(id: string): boolean {
+  const result = db.prepare(
+    `UPDATE mission_tasks SET autopushed_at = ? WHERE id = ? AND autopushed_at IS NULL`,
+  ).run(Math.floor(Date.now() / 1000), id);
+  return result.changes > 0;
+}
+
+/**
+ * Reason tag for an auto-retry, surfaced in the Telegram ping + hive_mind log
+ * so Aditya can see WHY the watchdog reran something without reading source.
+ */
+export type RetryReason = 'turn_cap' | 'timeout';
+
+export interface CreateRetryMissionResult {
+  /** id of the newly-queued retry mission (retry_attempt=1). */
+  childId: string;
+  /** id of the parent (failed, retry_attempt=0) mission. */
+  parentId: string;
+  /** Short human label for the reason — used by the Telegram ping. */
+  reason: RetryReason;
+  /** Agent the retry was dispatched to (mirrors parent). */
+  assignedAgent: string | null;
+  /** Retry title ("[retry] <parent title>") for message formatting. */
+  title: string;
+}
+
+/**
+ * Queue an auto-retry mission for a parent that failed with a transient
+ * error (turn-cap or timeout). Single-budget: this helper assumes the
+ * caller has already verified parent.retry_attempt === 0 — the DB-level
+ * enforcement lives in the watchdog's SQL eligibility clause.
+ *
+ * Mechanics (wrapped in a single transaction so the parent's escalated_at
+ * flip and the child's insert commit atomically):
+ *   1. Re-read parent to pull title / prompt / agent / priority / criteria.
+ *   2. Prepend a scope-reduction note to the original prompt so the muscle
+ *      agent knows it's a retry and should be ruthless about scope.
+ *   3. Insert the child row with retry_attempt=1, retried_from=parentId,
+ *      created_by='main' (so mission-autopush still fires a completion ping).
+ *   4. Stamp parent.escalated_at so the regular triage lane skips it.
+ *
+ * Returns structured metadata for the caller (watchdog) to feed into the
+ * Telegram retry-dispatch ping and hive_mind log — or null if the parent
+ * disappeared / was already escalated between eligibility check and call.
+ */
+export function createRetryMission(
+  parentId: string,
+  reason: RetryReason,
+): CreateRetryMissionResult | null {
+  const txn = db.transaction(() => {
+    const parent = db
+      .prepare(`SELECT * FROM mission_tasks WHERE id = ?`)
+      .get(parentId) as MissionTask | undefined;
+    if (!parent) return null;
+    // Defense-in-depth: even though the watchdog's SQL already filters on
+    // these, re-check at DB layer so a direct call from a future caller
+    // can't accidentally spawn a second retry or retry a non-main mission.
+    if (parent.status !== 'failed') return null;
+    if (parent.retry_attempt !== 0) return null;
+
+    const childId = crypto.randomBytes(4).toString('hex');
+    const reasonLabel = reason === 'turn_cap' ? 'turn-cap' : 'timeout';
+    const scopeNote =
+      `NOTE: Previous attempt (mission ${parentId}) failed after ${reasonLabel}.\n` +
+      `Be ruthless about scope reduction. If you see yourself approaching turn 30 or the\n` +
+      `timeout budget, ship what's done and flag the rest as Phase 2 in your result.\n` +
+      `Do not restart from scratch — if the parent left artifacts on disk or a branch,\n` +
+      `continue from there.\n\n`;
+    const childPrompt = scopeNote + (parent.prompt ?? '');
+    const rawTitle = `[retry] ${parent.title}`;
+    const title = rawTitle.length > 200 ? rawTitle.slice(0, 199) + '…' : rawTitle;
+    const now = Math.floor(Date.now() / 1000);
+
+    db.prepare(
+      `INSERT INTO mission_tasks
+         (id, title, prompt, assigned_agent, status, created_by, priority,
+          created_at, acceptance_criteria, timeout_ms, retry_attempt, retried_from)
+       VALUES (?, ?, ?, ?, 'queued', 'main', ?, ?, ?, ?, 1, ?)`,
+    ).run(
+      childId,
+      title,
+      childPrompt,
+      parent.assigned_agent,
+      parent.priority,
+      now,
+      parent.acceptance_criteria,
+      parent.timeout_ms,
+      parentId,
+    );
+
+    // Stamp the parent so the regular escalation path (createAutoTriageMission)
+    // skips it on this watchdog tick. Equivalent to the failed-mission stamp,
+    // just done here so the insert + stamp are one atomic unit.
+    db.prepare(
+      `UPDATE mission_tasks SET escalated_at = unixepoch() WHERE id = ?`,
+    ).run(parentId);
+
+    return {
+      childId,
+      parentId,
+      reason,
+      assignedAgent: parent.assigned_agent,
+      title,
+    } as CreateRetryMissionResult;
+  });
+
+  return txn();
 }
 
 // ── Call Pipeline Runs ───────────────────────────────────────────────
