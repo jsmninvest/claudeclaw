@@ -9,6 +9,7 @@
     "v1.7.0": ["add-scheduled-task-escalation"],
     "v1.7.1": ["add-mission-timeout-ms"],
     "v1.7.2": ["add-mission-autopushed-at"],
-    "v1.7.3": ["add-mission-retry-columns"]
+    "v1.7.3": ["add-mission-retry-columns"],
+    "v1.8.0": ["add-per-task-max-turns"]
   }
 }

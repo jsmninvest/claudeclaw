@@ -316,6 +316,7 @@ describe('mission-autopush', () => {
       autopushed_at: null,
       retry_attempt: 0,
       retried_from: null,
+      max_turns: null,
     };
     const text = formatSingle(m);
     expect(text).toContain('✅');
@@ -332,7 +333,7 @@ describe('mission-autopush', () => {
       error: error ?? null, created_by: 'main', priority: 5,
       created_at: 0, started_at: null, completed_at: null,
       acceptance_criteria: null, timeout_ms: null, autopushed_at: null,
-      retry_attempt: 0, retried_from: null,
+      retry_attempt: 0, retried_from: null, max_turns: null,
     });
     const text = formatBatched([
       mk('aaaa0000', 'completed', 'A'),

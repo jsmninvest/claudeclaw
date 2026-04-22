@@ -410,6 +410,12 @@ function runMigrations(database: Database.Database): void {
   if (!taskColNames.includes('model')) {
     database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN model TEXT`);
   }
+  // Per-task max-turns override (v1.8.0). NULL = fall back to AGENT_MAX_TURNS
+  // env default. Non-null lifts the turn cap for known-expensive tasks (e.g.
+  // the DION planner) without raising the global default for ad-hoc work.
+  if (!taskColNames.includes('max_turns')) {
+    database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN max_turns INTEGER`);
+  }
 
   // ── Memory V2 migration ──────────────────────────────────────────────
   // Detect old schema (has 'sector' column but no 'importance') and migrate.
@@ -629,6 +635,13 @@ function runMigrations(database: Database.Database): void {
   if (!missionColsPost.some((c) => c.name === 'retried_from')) {
     database.exec(`ALTER TABLE mission_tasks ADD COLUMN retried_from TEXT`);
     logger.info('Migration: added retried_from column to mission_tasks');
+  }
+  // Per-task max-turns override (v1.8.0). Same semantics as scheduled_tasks:
+  // NULL = fall back to AGENT_MAX_TURNS env default. Non-null raises the
+  // ceiling for this specific mission only.
+  if (!missionColsPost.some((c) => c.name === 'max_turns')) {
+    database.exec(`ALTER TABLE mission_tasks ADD COLUMN max_turns INTEGER`);
+    logger.info('Migration: added max_turns column to mission_tasks');
   }
   // Partial index scoped to failed+not-retried rows — matches the watchdog's
   // candidate query exactly. IF NOT EXISTS keeps this idempotent.
@@ -1090,6 +1103,8 @@ export interface ScheduledTask {
   started_at: number | null;
   last_status: 'success' | 'failed' | 'timeout' | null;
   model: string | null;
+  /** Per-task max-turns override. NULL = fall back to AGENT_MAX_TURNS env default. */
+  max_turns: number | null;
 }
 
 export function createScheduledTask(
@@ -1099,12 +1114,13 @@ export function createScheduledTask(
   nextRun: number,
   agentId = 'main',
   model?: string | null,
+  maxTurns: number | null = null,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO scheduled_tasks (id, prompt, schedule, next_run, status, created_at, agent_id, model)
-     VALUES (?, ?, ?, ?, 'active', ?, ?, ?)`,
-  ).run(id, prompt, schedule, nextRun, now, agentId, model ?? null);
+    `INSERT INTO scheduled_tasks (id, prompt, schedule, next_run, status, created_at, agent_id, model, max_turns)
+     VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
+  ).run(id, prompt, schedule, nextRun, now, agentId, model ?? null, maxTurns);
 }
 
 export function getDueTasks(agentId = 'main'): ScheduledTask[] {
@@ -1951,6 +1967,8 @@ export interface MissionTask {
   /** Pointer back to the parent mission id when this row IS an auto-retry.
    *  NULL on every original mission. Used for audit + test assertions. */
   retried_from: string | null;
+  /** Per-task max-turns override. NULL = fall back to AGENT_MAX_TURNS env default. */
+  max_turns: number | null;
 }
 
 export function createMissionTask(
@@ -1962,12 +1980,13 @@ export function createMissionTask(
   priority = 0,
   acceptanceCriteria: string | null = null,
   timeoutMs: number | null = null,
+  maxTurns: number | null = null,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO mission_tasks (id, title, prompt, assigned_agent, status, created_by, priority, created_at, acceptance_criteria, timeout_ms)
-     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`,
-  ).run(id, title, prompt, assignedAgent, createdBy, priority, now, acceptanceCriteria, timeoutMs);
+    `INSERT INTO mission_tasks (id, title, prompt, assigned_agent, status, created_by, priority, created_at, acceptance_criteria, timeout_ms, max_turns)
+     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)`,
+  ).run(id, title, prompt, assignedAgent, createdBy, priority, now, acceptanceCriteria, timeoutMs, maxTurns);
 }
 
 export function getUnassignedMissionTasks(): MissionTask[] {

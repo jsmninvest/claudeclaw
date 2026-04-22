@@ -96,8 +96,21 @@ async function runDueTasks(): Promise<void> {
         // Pre-run "Scheduled task running: ..." ping intentionally removed —
         // alert-router would drop it anyway. Silence the spam.
 
-        // Run as a fresh agent call (no session — scheduled tasks are autonomous)
-        const result = await runAgent(task.prompt, undefined, () => {}, undefined, resolveModelAlias(task.model), abortController, undefined, agentMcpAllowlist);
+        // Run as a fresh agent call (no session — scheduled tasks are autonomous).
+        // task.max_turns (if non-null) overrides the global AGENT_MAX_TURNS default —
+        // used by known-expensive tasks like the DION planner to lift the turn cap
+        // without raising the global default for ad-hoc throwaway work.
+        const result = await runAgent(
+          task.prompt,
+          undefined,
+          () => {},
+          undefined,
+          resolveModelAlias(task.model),
+          abortController,
+          undefined,
+          agentMcpAllowlist,
+          task.max_turns ?? undefined,
+        );
         clearTimeout(timeout);
 
         if (result.aborted) {
@@ -190,7 +203,18 @@ async function runDueMissionTasks(): Promise<void> {
     const timeout = setTimeout(() => abortController.abort(), TASK_TIMEOUT_MS);
 
     try {
-      const result = await runAgent(effectivePrompt, undefined, () => {}, undefined, undefined, abortController, undefined, agentMcpAllowlist);
+      // mission.max_turns (if non-null) overrides the global AGENT_MAX_TURNS default.
+      const result = await runAgent(
+        effectivePrompt,
+        undefined,
+        () => {},
+        undefined,
+        undefined,
+        abortController,
+        undefined,
+        agentMcpAllowlist,
+        mission.max_turns ?? undefined,
+      );
       clearTimeout(timeout);
 
       if (result.aborted) {

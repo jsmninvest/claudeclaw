@@ -270,6 +270,13 @@ export async function runAgent(
   abortController?: AbortController,
   onStreamText?: (accumulatedText: string) => void,
   mcpAllowlist?: string[],
+  /**
+   * Per-call override for the agentic turn cap. When provided and > 0 it takes
+   * precedence over AGENT_MAX_TURNS. Use for known-expensive tasks with
+   * legitimately multi-step validation + output (e.g. DION planner). NULL /
+   * undefined / 0 falls back to AGENT_MAX_TURNS.
+   */
+  maxTurnsOverride?: number | null,
 ): Promise<AgentResult> {
   // Read secrets from .env without polluting process.env.
   // CLAUDE_CODE_OAUTH_TOKEN is optional — the subprocess finds auth via ~/.claude/
@@ -359,8 +366,17 @@ export async function runAgent(
         allowDangerouslySkipPermissions: true,
 
         // Cap agentic turns to prevent runaway tool-use loops (e.g. retrying
-        // stale cookies 40+ times). Configurable via AGENT_MAX_TURNS in .env.
-        ...(AGENT_MAX_TURNS > 0 ? { maxTurns: AGENT_MAX_TURNS } : {}),
+        // stale cookies 40+ times). Default from AGENT_MAX_TURNS in .env;
+        // per-call override via maxTurnsOverride (set by scheduler from
+        // scheduled_tasks.max_turns / mission_tasks.max_turns). Override > 0
+        // wins over the env default; null/undefined/0 falls back.
+        ...(
+          maxTurnsOverride && maxTurnsOverride > 0
+            ? { maxTurns: maxTurnsOverride }
+            : AGENT_MAX_TURNS > 0
+              ? { maxTurns: AGENT_MAX_TURNS }
+              : {}
+        ),
 
         // Pass secrets to the subprocess without polluting our own process.env
         env: sdkEnv,

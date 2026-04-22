@@ -94,6 +94,52 @@ describe('runAgent — stream-tail hang regression (mission 81511133)', () => {
     expect(elapsed).toBeLessThan(3_000);
   }, 10_000);
 
+  it('passes maxTurnsOverride through to the SDK options (per-task turn cap)', async () => {
+    // Per-task max_turns override (v1.8.0). When the scheduler passes a
+    // non-null max_turns from scheduled_tasks / mission_tasks, runAgent must
+    // forward it to the SDK as `maxTurns` — overriding the AGENT_MAX_TURNS
+    // env default. Regression guard for the DION planner 60-turn-cap bug.
+    mockedQuery.mockImplementation(
+      () =>
+        fakeStream(
+          [
+            {
+              type: 'system',
+              subtype: 'init',
+              session_id: 'sess-maxturns',
+              model: 'claude-opus-4-7',
+              apiKeySource: 'none',
+              permissionMode: 'bypassPermissions',
+            },
+            {
+              type: 'result',
+              subtype: 'success',
+              result: 'ok',
+              total_cost_usd: 0.0,
+              usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 },
+            },
+          ],
+          /* hangAfter */ false,
+        ) as unknown as ReturnType<typeof query>,
+    );
+
+    await runAgent(
+      'expensive task',
+      undefined,   // sessionId
+      () => {},    // onEvent
+      undefined,   // cwd
+      undefined,   // model
+      undefined,   // abortController
+      undefined,   // onStreamText
+      undefined,   // mcpAllowlist
+      120,         // maxTurnsOverride
+    );
+
+    expect(mockedQuery).toHaveBeenCalledTimes(1);
+    const callArgs = mockedQuery.mock.calls[0][0] as { options: { maxTurns?: number } };
+    expect(callArgs.options.maxTurns).toBe(120);
+  });
+
   it('returns normally when the stream closes cleanly after the result event', async () => {
     mockedQuery.mockImplementation(
       () =>
