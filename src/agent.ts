@@ -11,15 +11,75 @@ import { logger } from './logger.js';
 // The Agent SDK's settingSources loads CLAUDE.md and permissions from
 // project/user settings, but does NOT load mcpServers from those files.
 // We read them ourselves and pass them via the `mcpServers` option.
+//
+// Two transports supported:
+//   - stdio: { command, args, env }       — default, spawns a subprocess
+//   - http:  { url, headers, type:'http' } — talks to a remote MCP server
+// Any `${VAR}` tokens in env values or header values are resolved against
+// process.env so we can keep secrets out of .claude/settings.json.
 
-interface McpStdioConfig {
+export interface McpStdioConfig {
+  type?: 'stdio';
   command: string;
   args?: string[];
   env?: Record<string, string>;
 }
 
-function loadMcpServers(allowlist?: string[]): Record<string, McpStdioConfig> {
-  const merged: Record<string, McpStdioConfig> = {};
+export interface McpHttpConfig {
+  type: 'http' | 'sse';
+  url: string;
+  headers?: Record<string, string>;
+}
+
+export type McpConfig = McpStdioConfig | McpHttpConfig;
+
+const ENV_VAR_PATTERN = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+
+/**
+ * Expand ${VAR} placeholders in a string using the supplied lookup map.
+ * Unknown variables are left as-is so the MCP server can surface a clear
+ * error instead of silently getting an empty value.
+ */
+function expandEnvVars(value: string, lookup: Record<string, string | undefined>): string {
+  return value.replace(ENV_VAR_PATTERN, (full, name) => {
+    const resolved = lookup[name];
+    return resolved !== undefined && resolved !== '' ? resolved : full;
+  });
+}
+
+function expandRecord(
+  rec: Record<string, string> | undefined,
+  lookup: Record<string, string | undefined>,
+): Record<string, string> | undefined {
+  if (!rec) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(rec)) {
+    out[k] = typeof v === 'string' ? expandEnvVars(v, lookup) : v;
+  }
+  return out;
+}
+
+/**
+ * Scan a JSON value recursively and collect every `${VAR}` name referenced.
+ * Used so we can load the matching keys from .env without pulling the whole
+ * file into process.env.
+ */
+function collectEnvVarRefs(value: unknown, out: Set<string>): void {
+  if (typeof value === 'string') {
+    for (const match of value.matchAll(ENV_VAR_PATTERN)) out.add(match[1]);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const v of value) collectEnvVarRefs(v, out);
+    return;
+  }
+  if (value && typeof value === 'object') {
+    for (const v of Object.values(value)) collectEnvVarRefs(v, out);
+  }
+}
+
+function loadMcpServers(allowlist?: string[]): Record<string, McpConfig> {
+  const merged: Record<string, McpConfig> = {};
 
   // Load from project settings (.claude/settings.json in cwd)
   const projectSettings = path.join(agentCwd ?? PROJECT_ROOT, '.claude', 'settings.json');
@@ -30,24 +90,66 @@ function loadMcpServers(allowlist?: string[]): Record<string, McpStdioConfig> {
     'settings.json',
   );
 
+  // First pass: parse both files and collect every ${VAR} name referenced so
+  // we can pull just those keys from .env (readEnvFile is opt-in per key).
+  const parsed: Array<Record<string, unknown>> = [];
+  const referenced = new Set<string>();
   for (const file of [userSettings, projectSettings]) {
     try {
       const raw = JSON.parse(fs.readFileSync(file, 'utf-8'));
       const servers = raw?.mcpServers;
       if (servers && typeof servers === 'object') {
-        for (const [name, config] of Object.entries(servers)) {
-          const cfg = config as Record<string, unknown>;
-          if (cfg.command && typeof cfg.command === 'string') {
-            merged[name] = {
-              command: cfg.command,
-              ...(cfg.args ? { args: cfg.args as string[] } : {}),
-              ...(cfg.env ? { env: cfg.env as Record<string, string> } : {}),
-            };
-          }
-        }
+        parsed.push(servers as Record<string, unknown>);
+        collectEnvVarRefs(servers, referenced);
       }
     } catch {
       // File doesn't exist or is invalid — skip
+    }
+  }
+
+  // Build a lookup that prefers process.env then falls back to .env. This
+  // mirrors how the CLI resolves variables: ambient env wins, .env is the
+  // safety net for values that intentionally aren't exported.
+  const fromEnvFile = referenced.size > 0 ? readEnvFile([...referenced]) : {};
+  const lookup: Record<string, string | undefined> = { ...fromEnvFile };
+  for (const name of referenced) {
+    const fromProcess = process.env[name];
+    if (fromProcess !== undefined && fromProcess !== '') lookup[name] = fromProcess;
+  }
+
+  for (const servers of parsed) {
+    for (const [name, config] of Object.entries(servers)) {
+      const cfg = config as Record<string, unknown>;
+
+      // HTTP/SSE transport: url-based, no subprocess
+      if (typeof cfg.url === 'string') {
+        const transport = cfg.type === 'sse' ? 'sse' : 'http';
+        const headers = expandRecord(
+          cfg.headers as Record<string, string> | undefined,
+          lookup,
+        );
+        merged[name] = {
+          type: transport,
+          url: expandEnvVars(cfg.url, lookup),
+          ...(headers ? { headers } : {}),
+        };
+        continue;
+      }
+
+      // Stdio transport: command-based (default)
+      if (typeof cfg.command === 'string') {
+        const env = expandRecord(
+          cfg.env as Record<string, string> | undefined,
+          lookup,
+        );
+        merged[name] = {
+          command: expandEnvVars(cfg.command, lookup),
+          ...(cfg.args
+            ? { args: (cfg.args as string[]).map((a) => expandEnvVars(a, lookup)) }
+            : {}),
+          ...(env ? { env } : {}),
+        };
+      }
     }
   }
 
@@ -168,20 +270,36 @@ export async function runAgent(
   abortController?: AbortController,
   onStreamText?: (accumulatedText: string) => void,
   mcpAllowlist?: string[],
+  /**
+   * Per-call override for the agentic turn cap. When provided and > 0 it takes
+   * precedence over AGENT_MAX_TURNS. Use for known-expensive tasks with
+   * legitimately multi-step validation + output (e.g. DION planner). NULL /
+   * undefined / 0 falls back to AGENT_MAX_TURNS.
+   */
+  maxTurnsOverride?: number | null,
 ): Promise<AgentResult> {
   // Read secrets from .env without polluting process.env.
   // CLAUDE_CODE_OAUTH_TOKEN is optional — the subprocess finds auth via ~/.claude/
   // automatically. Only needed if you want to override which account is used.
-  const secrets = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
+  const secrets = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN']);
 
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
   if (secrets.CLAUDE_CODE_OAUTH_TOKEN) {
     sdkEnv.CLAUDE_CODE_OAUTH_TOKEN = secrets.CLAUDE_CODE_OAUTH_TOKEN;
   }
-  if (secrets.ANTHROPIC_API_KEY) {
-    sdkEnv.ANTHROPIC_API_KEY = secrets.ANTHROPIC_API_KEY;
-  }
 
+  // CRITICAL: Scrub ANTHROPIC_API_KEY from the subprocess env so the CLI is
+  // forced to use the Claude Max OAuth session (~/.claude/) instead of
+  // falling back to pay-per-token API billing. Even if the key appears in
+  // the parent shell (e.g. sourced from another project's .env), we don't
+  // let it reach the child. Set CLAUDE_CODE_OAUTH_TOKEN in .env if you want
+  // to pin a specific OAuth account.
+  delete sdkEnv.ANTHROPIC_API_KEY;
+
+  // Force model via env var — more reliable than SDK options.model
+  if (model) {
+    sdkEnv.ANTHROPIC_MODEL = model;
+  }
   let newSessionId: string | undefined;
   let resultText: string | null = null;
   let usage: UsageInfo | null = null;
@@ -195,6 +313,25 @@ export async function runAgent(
   // Telegram's "typing..." action expires after ~5s.
   const typingInterval = setInterval(onTyping, 4000);
 
+  // Grace window after the SDK emits a `result` event. Some long Opus runs with
+  // multiple MCP servers (ghl-mcp-server in particular) never close the async
+  // iterable after result — the for-await hangs on the next `.next()` call until
+  // the outer turn timeout fires (~30 min). We force-exit the loop this many ms
+  // after result so the turn resolves promptly with the captured resultText.
+  // Override with AGENT_STREAM_GRACE_MS (used by tests).
+  const graceMs = Math.max(
+    0,
+    parseInt(process.env.AGENT_STREAM_GRACE_MS ?? '5000', 10),
+  );
+
+  // Force-exit signal fired by the grace timer after result
+  let forceExitAfterResult = false;
+  let resolveForceExit: (() => void) | null = null;
+  const forceExitPromise = new Promise<void>((resolve) => {
+    resolveForceExit = resolve;
+  });
+  let graceTimer: ReturnType<typeof setTimeout> | null = null;
+
   try {
     // Load MCP servers from project + user settings files, filtered by agent allowlist
     const mcpServers = loadMcpServers(mcpAllowlist);
@@ -207,7 +344,11 @@ export async function runAgent(
     // SDK Options.mcpServers expects Record<string, McpServerConfig>
     const mcpServerSpecs = mcpServerNames.length > 0 ? mcpServers : undefined;
 
-    for await (const event of query({
+    // We manually iterate the async iterable (instead of `for await`) so we
+    // can race `.next()` against the post-result grace timer. If the SDK
+    // stream stalls after the `result` event, the race lets us break free
+    // instead of waiting forever on `.next()`.
+    const stream = query({
       prompt: singleTurn(message),
       options: {
         // cwd = agent directory (if running as agent) or project root.
@@ -225,8 +366,17 @@ export async function runAgent(
         allowDangerouslySkipPermissions: true,
 
         // Cap agentic turns to prevent runaway tool-use loops (e.g. retrying
-        // stale cookies 40+ times). Configurable via AGENT_MAX_TURNS in .env.
-        ...(AGENT_MAX_TURNS > 0 ? { maxTurns: AGENT_MAX_TURNS } : {}),
+        // stale cookies 40+ times). Default from AGENT_MAX_TURNS in .env;
+        // per-call override via maxTurnsOverride (set by scheduler from
+        // scheduled_tasks.max_turns / mission_tasks.max_turns). Override > 0
+        // wins over the env default; null/undefined/0 falls back.
+        ...(
+          maxTurnsOverride && maxTurnsOverride > 0
+            ? { maxTurns: maxTurnsOverride }
+            : AGENT_MAX_TURNS > 0
+              ? { maxTurns: AGENT_MAX_TURNS }
+              : {}
+        ),
 
         // Pass secrets to the subprocess without polluting our own process.env
         env: sdkEnv,
@@ -243,12 +393,55 @@ export async function runAgent(
         // Abort support — signals the SDK to kill the subprocess
         ...(abortController ? { abortController } : {}),
       },
-    })) {
-      const ev = event as Record<string, unknown>;
+    });
+
+    const iterator = stream[Symbol.asyncIterator]();
+    while (true) {
+      // Race the next event against the post-result force-exit signal.
+      // Before result: forceExitPromise is pending, so this resolves on the
+      // next event (or end of stream). After result: the grace timer fires
+      // forceExitPromise, unblocking us even if the SDK never closes the
+      // iterator.
+      const outcome = await Promise.race([
+        iterator.next().then((r) => ({ kind: 'event' as const, r })),
+        forceExitPromise.then(() => ({ kind: 'force-exit' as const })),
+      ]);
+
+      if (outcome.kind === 'force-exit') {
+        logger.warn(
+          { graceMs },
+          'Stream did not close after result; forcing exit',
+        );
+        // Best-effort cleanup — tell the SDK to release the subprocess/stream.
+        // IMPORTANT: do NOT await iterator.return(). If the SDK's async
+        // generator is suspended at an `await` that never resolves (exactly
+        // the hang we're fixing), awaiting return() will itself hang. Fire
+        // and forget; swallow any rejection so it doesn't become unhandled.
+        try {
+          const ret = iterator.return?.(undefined);
+          if (ret && typeof (ret as Promise<unknown>).catch === 'function') {
+            (ret as Promise<unknown>).catch(() => {});
+          }
+        } catch {
+          // ignore — we've already captured resultText + usage
+        }
+        break;
+      }
+
+      if (outcome.r.done) break;
+      const ev = outcome.r.value as Record<string, unknown>;
 
       if (ev['type'] === 'system' && ev['subtype'] === 'init') {
         newSessionId = ev['session_id'] as string;
-        logger.info({ newSessionId }, 'Session initialized');
+        logger.info(
+          {
+            newSessionId,
+            model: ev['model'],
+            apiKeySource: ev['apiKeySource'],
+            permissionMode: ev['permissionMode'],
+          },
+          'Session initialized',
+        );
       }
 
       // Detect auto-compaction (context window was getting full)
@@ -354,6 +547,21 @@ export async function runAgent(
           { hasResult: !!resultText, subtype: ev['subtype'] },
           'Agent result received',
         );
+
+        // Arm the grace timer. Post-result events (tool_result tails, MCP
+        // teardown, etc.) are welcome to arrive within `graceMs`, but we will
+        // not wait on `.next()` longer than that. Prevents the 24-min hang
+        // observed on Opus + ghl-mcp-server multi-tool runs.
+        if (graceTimer === null) {
+          graceTimer = setTimeout(() => {
+            forceExitAfterResult = true;
+            resolveForceExit?.();
+          }, graceMs);
+          // Don't keep the event loop alive just for this timer.
+          if (typeof graceTimer === 'object' && graceTimer && 'unref' in graceTimer) {
+            (graceTimer as { unref: () => void }).unref();
+          }
+        }
       }
     }
   } catch (err) {
@@ -364,7 +572,12 @@ export async function runAgent(
     throw err;
   } finally {
     clearInterval(typingInterval);
+    if (graceTimer !== null) clearTimeout(graceTimer);
   }
 
+  // Note: when forceExitAfterResult is true, resultText + usage were already
+  // captured from the `result` event before the grace timer fired. We return
+  // them as a successful turn — the agent's work completed, the stream tail
+  // just never closed. Not marking `aborted`.
   return { text: resultText, newSessionId, usage };
 }

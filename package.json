@@ -1,6 +1,6 @@
 {
   "name": "claudeclaw",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Your personal Claude Code assistant, delivered to your phone via Telegram",
   "type": "module",
   "main": "dist/index.js",
@@ -16,12 +16,16 @@
     "setup": "tsx scripts/setup.ts",
     "status": "tsx scripts/status.ts",
     "agent:create": "bash scripts/agent-create.sh",
-    "agent:start": "node dist/index.js --agent"
+    "agent:start": "node dist/index.js --agent",
+    "supabase:probe": "tsx scripts/supabase-schema-probe.ts",
+    "supabase:export": "tsx scripts/supabase-export.ts",
+    "supabase:import": "tsx scripts/supabase-import.ts"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.34",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.114",
     "@google/genai": "^1.44.0",
     "@hono/node-server": "^1.19.9",
+    "@pinecone-database/pinecone": "^7.2.0",
     "@slack/web-api": "^7.14.1",
     "better-sqlite3": "^11.8.1",
     "cron-parser": "^5.5.0",
