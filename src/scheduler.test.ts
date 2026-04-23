@@ -10,8 +10,10 @@ import {
   deleteScheduledTask,
   pauseScheduledTask,
   resumeScheduledTask,
+  setTaskNextRun,
 } from './db.js';
 import type { ScheduledTask } from './db.js';
+import { catchUpMissedTasks, computePrevRun, computeNextRun } from './scheduler.js';
 
 describe('task state machine', () => {
   beforeEach(() => {
@@ -359,6 +361,127 @@ describe('task state machine', () => {
 
       const tasks = getAllScheduledTasks('main');
       expect(tasks[0].status).toBe('active');
+    });
+  });
+
+  // ── setTaskNextRun (catch-up helper) ──────────────────────────────
+
+  describe('setTaskNextRun', () => {
+    it('rewrites next_run without touching status or last_run', () => {
+      const past = Math.floor(Date.now() / 1000) - 60;
+      const futureRun = Math.floor(Date.now() / 1000) + 86400;
+      createScheduledTask('t1', 'task', '0 9 * * *', futureRun, 'main');
+      // bump last_run so we can assert it doesn't get wiped
+      updateTaskAfterRun('t1', futureRun, 'first run', 'success');
+
+      setTaskNextRun('t1', past);
+
+      const tasks = getAllScheduledTasks('main');
+      expect(tasks[0].next_run).toBe(past);
+      expect(tasks[0].status).toBe('active');
+      expect(tasks[0].last_result).toBe('first run');
+      expect(tasks[0].last_status).toBe('success');
+    });
+  });
+
+  // ── catchUpMissedTasks (silent-skip recovery) ─────────────────────
+
+  describe('catchUpMissedTasks', () => {
+    it('rewinds next_run when a task was silently skipped within the window', () => {
+      // Simulate the fceeaed4 bug: task fired, markTaskRunning advanced
+      // next_run to tomorrow, run crashed, resetStuckTasks restored active
+      // but left next_run tomorrow. Previous occurrence was this morning.
+      const now = Math.floor(Date.now() / 1000);
+      const tomorrow = now + 86400;
+      const dailySchedule = '0 9 * * *';
+      createScheduledTask('t1', 'morning briefing', dailySchedule, tomorrow, 'main');
+      // last_run far in the past so it's not "already ran this cycle"
+      updateTaskAfterRun('t1', tomorrow, 'yesterday result', 'success');
+      // force last_run back 48h so it predates prev occurrence
+      const twoDaysAgo = now - 2 * 86400;
+      // hack last_run via direct setter (same DB, no helper — use pragma)
+      // easier: just assert behavior against the actual previous cron occurrence
+      // Instead of hacking the DB, let prevOccurrence be within 24h.
+      const prev = computePrevRun(dailySchedule);
+      // If prev is within 24h and NOT > last_run, catch-up will skip.
+      // For the test, set next_run so prev is >= 5min ago and last_run is old.
+      // We rewrote next_run to tomorrow above. Clear last_run by re-inserting.
+      deleteScheduledTask('t1');
+      createScheduledTask('t1', 'morning briefing', dailySchedule, tomorrow, 'main');
+      // last_run is NULL now.
+
+      const count = catchUpMissedTasks('main');
+
+      const tasks = getAllScheduledTasks('main');
+      if (now - prev < 300) {
+        // Previous occurrence was < 5min ago (CATCHUP_LATENESS_THRESHOLD):
+        // catch-up should NOT fire — too fresh.
+        expect(count).toBe(0);
+        expect(tasks[0].next_run).toBe(tomorrow);
+      } else if (now - prev > 86400) {
+        // Previous occurrence too stale for catch-up window:
+        // catch-up should NOT fire.
+        expect(count).toBe(0);
+        expect(tasks[0].next_run).toBe(tomorrow);
+      } else {
+        // Previous occurrence is in the catch-up window:
+        // next_run should be rewound to prevOccurrence.
+        expect(count).toBe(1);
+        expect(tasks[0].next_run).toBe(prev);
+      }
+    });
+
+    it('does NOT rewind when task already ran for the current cycle', () => {
+      // last_run > prev occurrence means we already fired this slot.
+      const now = Math.floor(Date.now() / 1000);
+      const tomorrow = now + 86400;
+      createScheduledTask('t1', 'task', '0 9 * * *', tomorrow, 'main');
+      // Simulate a fresh run that covered the last slot
+      updateTaskAfterRun('t1', tomorrow, 'fresh', 'success');
+
+      const count = catchUpMissedTasks('main');
+      expect(count).toBe(0);
+
+      const tasks = getAllScheduledTasks('main');
+      expect(tasks[0].next_run).toBe(tomorrow);
+    });
+
+    it('does NOT affect tasks already due (getDueTasks will handle them)', () => {
+      const now = Math.floor(Date.now() / 1000);
+      const past = now - 3600;
+      createScheduledTask('t1', 'already due', '0 9 * * *', past, 'main');
+
+      const count = catchUpMissedTasks('main');
+      expect(count).toBe(0);
+
+      const tasks = getAllScheduledTasks('main');
+      expect(tasks[0].next_run).toBe(past); // untouched
+    });
+
+    it('does NOT affect paused or running tasks', () => {
+      const now = Math.floor(Date.now() / 1000);
+      const tomorrow = now + 86400;
+      createScheduledTask('t1', 'paused', '0 9 * * *', tomorrow, 'main');
+      createScheduledTask('t2', 'running', '0 9 * * *', tomorrow, 'main');
+      pauseScheduledTask('t1');
+      markTaskRunning('t2');
+
+      const count = catchUpMissedTasks('main');
+      expect(count).toBe(0);
+    });
+
+    it('isolates by agent_id', () => {
+      // Only the matching agent's tasks should be considered.
+      const now = Math.floor(Date.now() / 1000);
+      const tomorrow = now + 86400;
+      createScheduledTask('t1', 'content task', '0 9 * * *', tomorrow, 'content');
+      createScheduledTask('t2', 'main task', '0 9 * * *', tomorrow, 'main');
+
+      catchUpMissedTasks('main');
+
+      // 't1' is on content — should be untouched when we sweep 'main'.
+      const contentTasks = getAllScheduledTasks('content');
+      expect(contentTasks[0].next_run).toBe(tomorrow);
     });
   });
 

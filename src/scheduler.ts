@@ -13,6 +13,8 @@ import {
   completeMissionTask,
   resetStuckMissionTasks,
   getCallPipelineRun,
+  getAllScheduledTasks,
+  setTaskNextRun,
 } from './db.js';
 import { logger } from './logger.js';
 import { messageQueue } from './message-queue.js';
@@ -29,6 +31,20 @@ type Sender = (text: string) => Promise<void>;
  *  Configurable via SCHEDULED_TASK_TIMEOUT_MS in .env.
  *  Default: 30 minutes (DION storyboard pipelines need 12–25 min). */
 const TASK_TIMEOUT_MS = parseInt(process.env.SCHEDULED_TASK_TIMEOUT_MS || '1800000', 10);
+
+/** How far back a missed cron occurrence can be for catch-up to fire.
+ *  If the last scheduled time is older than this, the task is considered
+ *  stale (e.g. day-old DION morning content) and we skip catch-up, just
+ *  re-aligning next_run to the next future occurrence.
+ *  Configurable via SCHEDULED_TASK_CATCHUP_MAX_AGE_SECONDS. Default: 24h. */
+const CATCHUP_MAX_AGE_SECONDS = parseInt(
+  process.env.SCHEDULED_TASK_CATCHUP_MAX_AGE_SECONDS || '86400',
+  10,
+);
+
+/** Minimum lateness (seconds) before we tag a run as "CATCHUP". Anything
+ *  under this is just normal scheduler jitter — don't spam the label. */
+const CATCHUP_LATENESS_THRESHOLD_SECONDS = 300; // 5 minutes
 
 let sender: Sender;
 
@@ -61,8 +77,92 @@ export function initScheduler(send: Sender, agentId = 'main'): void {
     logger.warn({ recovered: recoveredMission, agentId }, 'Reset stuck mission tasks from previous crash');
   }
 
+  // Catch up tasks that were silently skipped. This handles the case where
+  // a prior fire called markTaskRunning (advancing next_run) and then
+  // crashed before updateTaskAfterRun could run. resetStuckTasks restores
+  // status='active' but leaves next_run in the future, so getDueTasks
+  // never picks the task up again — it silently disappears for one cycle.
+  const caughtUp = catchUpMissedTasks(agentId);
+  if (caughtUp > 0) {
+    logger.warn({ caughtUp, agentId }, 'Queued catch-up for silently-skipped scheduled tasks');
+  }
+
   setInterval(() => void runDueTasks(), 60_000);
   logger.info({ agentId }, 'Scheduler started (checking every 60s)');
+}
+
+/**
+ * Scan this agent's active scheduled tasks for missed occurrences and rewind
+ * next_run so they fire on the next tick. Runs once at startup.
+ *
+ * A task is a "silent skip" candidate when:
+ *   - status = 'active' (so NOT currently running, not paused)
+ *   - next_run is in the FUTURE (so getDueTasks would never pick it up)
+ *   - the PREVIOUS cron occurrence is in the past AND within the catch-up
+ *     window (CATCHUP_MAX_AGE_SECONDS)
+ *   - last_run is either null or predates that previous occurrence
+ *     (otherwise the task already fired for this cycle)
+ *
+ * Returns the number of tasks rewound.
+ */
+export function catchUpMissedTasks(agentId: string): number {
+  const now = Math.floor(Date.now() / 1000);
+  const tasks = getAllScheduledTasks(agentId).filter(t => t.status === 'active');
+  let count = 0;
+
+  for (const task of tasks) {
+    // Already due — runDueTasks will handle it on the next tick.
+    if (task.next_run <= now) continue;
+
+    let prevOccurrence: number;
+    try {
+      prevOccurrence = computePrevRun(task.schedule);
+    } catch (err) {
+      logger.warn({ err, taskId: task.id, schedule: task.schedule }, 'catchUp: cron parse failed');
+      continue;
+    }
+
+    // Previous occurrence must be in the past (sanity).
+    if (prevOccurrence > now) continue;
+
+    const secondsLate = now - prevOccurrence;
+
+    // Too fresh — normal jitter, not a miss.
+    if (secondsLate < CATCHUP_LATENESS_THRESHOLD_SECONDS) continue;
+
+    // Too stale — don't fire day-old content.
+    if (secondsLate > CATCHUP_MAX_AGE_SECONDS) continue;
+
+    // Did the task already run for this cycle? last_run >= prevOccurrence
+    // means the most recent fire covered the last scheduled slot. Allow a
+    // small tolerance (60s) for clock skew between cron math and last_run.
+    if (task.last_run !== null && task.last_run >= prevOccurrence - 60) continue;
+
+    // Rewind next_run to the previous occurrence so runDueTasks fires it
+    // immediately. We use prevOccurrence (not `now`) so the lateness is
+    // visible in runDueTasks and can be logged as "CATCHUP: fired Xh Ym late".
+    setTaskNextRun(task.id, prevOccurrence);
+    logger.info(
+      { taskId: task.id, secondsLate, prompt: task.prompt.slice(0, 60) },
+      'catchUp: rewinding next_run for silently-skipped task',
+    );
+    count++;
+  }
+
+  return count;
+}
+
+/**
+ * Format a duration in seconds as "Xh Ym" (or "Ym Xs" if under 1h).
+ * Used to render lateness in catch-up fire markers.
+ */
+function formatLateness(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  if (s < 60) return `${s}s`;
+  const mins = Math.floor(s / 60);
+  if (mins < 60) return `${mins}m ${s % 60}s`;
+  const hrs = Math.floor(mins / 60);
+  return `${hrs}h ${mins % 60}m`;
 }
 
 async function runDueTasks(): Promise<void> {
@@ -79,13 +179,30 @@ async function runDueTasks(): Promise<void> {
       continue;
     }
 
+    const nowSec = Math.floor(Date.now() / 1000);
+    const latenessSec = Math.max(0, nowSec - task.next_run);
+
+    // Max-age cutoff: if a task's scheduled time is more than the
+    // catch-up window in the past, it's stale (day-old morning content,
+    // etc). Skip the actual run, advance next_run to the next future
+    // occurrence, and log the skip in last_result.
+    if (latenessSec > CATCHUP_MAX_AGE_SECONDS) {
+      const nextFuture = computeNextRun(task.schedule);
+      const note = `SKIPPED (stale): scheduled ${formatLateness(latenessSec)} ago, beyond ${formatLateness(CATCHUP_MAX_AGE_SECONDS)} catch-up window. Rescheduled for next occurrence.`;
+      updateTaskAfterRun(task.id, nextFuture, note, 'failed');
+      logger.warn({ taskId: task.id, latenessSec, prompt: task.prompt.slice(0, 60) }, 'Skipping stale task beyond catch-up window');
+      continue;
+    }
+
+    const isCatchup = latenessSec >= CATCHUP_LATENESS_THRESHOLD_SECONDS;
+
     // Compute next occurrence BEFORE executing so we can lock the task
     // in the DB immediately, preventing re-fire on subsequent ticks.
     const nextRun = computeNextRun(task.schedule);
     runningTaskIds.add(task.id);
     markTaskRunning(task.id, nextRun);
 
-    logger.info({ taskId: task.id, prompt: task.prompt.slice(0, 60) }, 'Firing task');
+    logger.info({ taskId: task.id, prompt: task.prompt.slice(0, 60), latenessSec, isCatchup }, 'Firing task');
 
     // Route through the message queue so scheduled tasks wait for any
     // in-flight user message to finish before running. This prevents
@@ -131,12 +248,18 @@ async function runDueTasks(): Promise<void> {
         }
 
         const text = result.text?.trim() || 'Task completed with no output.';
+        // When a fire is significantly late (catch-up from a silent skip
+        // or a missed window), prefix the stored result so it's obvious
+        // in /tasks output and the Telegram digest.
+        const storedText = isCatchup
+          ? `CATCHUP: fired ${formatLateness(latenessSec)} late\n\n${text}`
+          : text;
         // Route through alert-router. For realtime/legacy behaviour it chunks
         // internally; for digest it queues the full payload.
         await sendAlert({
           agentId: task.agent_id || schedulerAgentId,
           chatId,
-          content: formatForTelegram(text),
+          content: formatForTelegram(storedText),
           category: 'task_result',
           meta: { taskId: task.id, prompt: task.prompt.slice(0, 80) },
         });
@@ -148,9 +271,9 @@ async function runDueTasks(): Promise<void> {
           logConversationTurn(ALLOWED_CHAT_ID, 'assistant', text, activeSession ?? undefined, schedulerAgentId);
         }
 
-        updateTaskAfterRun(task.id, nextRun, text, 'success');
+        updateTaskAfterRun(task.id, nextRun, storedText, 'success');
 
-        logger.info({ taskId: task.id, nextRun }, 'Task complete, next run scheduled');
+        logger.info({ taskId: task.id, nextRun, isCatchup, latenessSec }, 'Task complete, next run scheduled');
       } catch (err) {
         clearTimeout(timeout);
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -416,4 +539,14 @@ export function advanceCallPipeline(missionTitle: string, resultText: string): v
 export function computeNextRun(cronExpression: string): number {
   const interval = CronExpressionParser.parse(cronExpression);
   return Math.floor(interval.next().getTime() / 1000);
+}
+
+/**
+ * Return the PREVIOUS cron occurrence (unix seconds) for the given
+ * expression, measured from "now". Used by catchUpMissedTasks to detect
+ * silently-skipped scheduled tasks.
+ */
+export function computePrevRun(cronExpression: string): number {
+  const interval = CronExpressionParser.parse(cronExpression);
+  return Math.floor(interval.prev().getTime() / 1000);
 }

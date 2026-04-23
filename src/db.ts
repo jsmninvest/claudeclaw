@@ -1181,6 +1181,16 @@ export function resetStuckTasks(agentId: string): number {
   return result.changes;
 }
 
+/**
+ * Directly set a task's next_run. Used by the scheduler's catch-up logic to
+ * rewind next_run when a task was silently skipped (e.g., fired + crashed +
+ * reset-stuck left next_run advanced into the future). Does NOT change
+ * status or started_at.
+ */
+export function setTaskNextRun(id: string, nextRun: number): void {
+  db.prepare(`UPDATE scheduled_tasks SET next_run = ? WHERE id = ?`).run(nextRun, id);
+}
+
 export function deleteScheduledTask(id: string): void {
   db.prepare('DELETE FROM scheduled_tasks WHERE id = ?').run(id);
 }
