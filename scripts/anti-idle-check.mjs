@@ -3,18 +3,23 @@
  * Anti-Idle Auto-Dispatcher (claudeclaw port)
  *
  * Layer 1 of 2. Pure decision engine — NO side effects on the Kanban.
- * - stdout: strict JSON (dispatcher contract, version 2)
+ * - stdout: strict JSON (dispatcher contract, version 3)
  * - stderr: diagnostics only
  *
- * Ported from /Users/aditya_office_ai_assistant/clawd/scripts/check-kanban-todo.mjs
- * Differences vs /clawd:
+ * Anti-Idle v5 (May 2026): the dispatcher no longer keyword-routes tasks to
+ * domain agents. It only identifies idle todo tasks and surfaces them as
+ * triage candidates. The orchestrator creates `triage_idle_kanban` missions
+ * to Main (Rudy), who decides the domain expert. See docs/anti-idle-v5-spec.md.
+ *
+ * Notes:
  * - Default Kanban source is local SQLite (claudeclaw.db.kanban_tasks), per the
  *   2026-04-19 "Kanban migrated from Supabase" decision. Opt in to Supabase with
  *   ANTI_IDLE_KANBAN_SOURCE=supabase.
  * - Deterministic-only selection; no OpenAI call (user spec: "pure logic").
  * - No live task claim here. Claim happens in the orchestrator when the mission
  *   task is created, so this script is idempotent + easy to dry-run.
- * - Routing targets map to claudeclaw agents: builder / content / research / ops.
+ * - Tasks already inside the v5 chain (workflow_state IS NOT NULL) are filtered
+ *   out at the SQL layer so we don't re-triage in-flight work every cron tick.
  *
  * Env:
  *   ANTI_IDLE_DRY_RUN=1             — dry run (no state writes)
@@ -76,10 +81,25 @@ function safeJsonParse(text, fallback = null) {
 }
 
 function parseTags(raw) {
-  if (Array.isArray(raw)) return raw;
-  if (!raw) return [];
-  const parsed = safeJsonParse(raw, null);
-  return Array.isArray(parsed) ? parsed : [];
+  const flatten = (value) => {
+    if (value == null) return [];
+    if (Array.isArray(value)) return value.flatMap(flatten);
+    if (value instanceof Set) return [...value].flatMap(flatten);
+    if (typeof value === 'string') {
+      const s = value.trim();
+      if (!s) return [];
+      const parsed = safeJsonParse(s, null);
+      if (Array.isArray(parsed) || parsed instanceof Set || (parsed && typeof parsed === 'object')) return flatten(parsed);
+      return [s];
+    }
+    if (typeof value === 'object') {
+      const tagValue = value.tag ?? value.name ?? value.label ?? value.value ?? value.id;
+      return tagValue == null ? [] : flatten(tagValue);
+    }
+    return [String(value)];
+  };
+
+  return flatten(raw).map((tag) => String(tag).trim()).filter(Boolean);
 }
 
 function priorityScore(priority) {
@@ -140,9 +160,14 @@ function parseSop(task) {
   const headingValue = (labels) => {
     for (const label of labels) {
       const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const re = new RegExp(`(?:^|\\n)\\s*${escaped}\\s*:\\s*([^\\n]+)`, 'i');
-      const m = text.match(re);
-      if (m && m[1]) return sanitizeText(m[1]);
+      // Match "FIELD: value" (colon on same line)
+      const reColon = new RegExp(`(?:^|\\n)[^\\S\\n]*${escaped}[^\\S\\n]*:[^\\S\\n]*([^\\n]+)`, 'i');
+      const m1 = text.match(reColon);
+      if (m1 && m1[1]) return sanitizeText(m1[1]);
+      // Match "## FIELD\nvalue" (markdown heading, reject if next line is another heading)
+      const reHeading = new RegExp(`(?:^|\\n)[^\\S\\n]*#{1,3}[^\\S\\n]+${escaped}[^\\S\\n]*:?[^\\S\\n]*\\n(?![^\\S\\n]*#{1,6}\\s)[^\\S\\n]*([^\\n]+)`, 'i');
+      const m2 = text.match(reHeading);
+      if (m2 && m2[1]) return sanitizeText(m2[1]);
     }
     return '';
   };
@@ -187,27 +212,9 @@ function parseSop(task) {
   return { presentCount, nextStepPresent: fields.next_step, missingFields, blockerSummary, blockedSignal, userNeedsSignal };
 }
 
-// Routing → claudeclaw agent IDs
-function routingTarget(task) {
-  const { lower } = getText(task);
-  if (/\b(write|copy|newsletter|landing page|content|post|caption|tiktok|carousel|blog)\b/i.test(lower)) return 'content';
-  if (/\b(research|analyze|investigate|benchmark|competitor|market|compare)\b/i.test(lower)) return 'research';
-  if (/\b(ops|calendar|admin|process|inbox|scheduling|triage)\b/i.test(lower)) return 'ops';
-  if (/\b(code|bug|fix|debug|build|repo|script|api|database|sql|test|pipeline|automation|deploy|migration|schema)\b/i.test(lower)) return 'builder';
-  return 'coordinator_review';
-}
-
-function routeConfidence(task, target) {
-  const { lower } = getText(task);
-  if (target === 'coordinator_review') return 0.5;
-  const map = {
-    builder: /(code|bug|fix|debug|build|repo|script|api|database|sql|test|pipeline|automation|deploy|migration|schema)/i,
-    content: /(write|copy|newsletter|landing page|content|post|caption|tiktok|carousel|blog)/i,
-    research: /(research|analyze|investigate|benchmark|competitor|market|compare)/i,
-    ops: /(ops|calendar|admin|process|inbox|scheduling|triage)/i,
-  };
-  return map[target]?.test(lower) ? 0.9 : 0.65;
-}
+// Anti-Idle v5: keyword-based routing removed. Dispatcher does not pick a
+// domain expert — Main (Rudy) does that during the triage mission. Every
+// idle task is a triage candidate; routing decisions belong to Main.
 
 function buildTaskRecord(task, state) {
   const ageHours = getAgeHours(task);
@@ -215,6 +222,7 @@ function buildTaskRecord(task, state) {
   const pBucket = priorityBucket(task.priority);
   const sop = parseSop(task);
   const tags = parseTags(task.tags);
+  const normalizedTags = new Set(tags.map((t) => String(t || '').trim().toLowerCase()));
 
   const grandfathered = Array.isArray(state.legacyGrandfatheredTaskIds) && state.legacyGrandfatheredTaskIds.includes(task.id);
   const sopOk = grandfathered || (sop.nextStepPresent && sop.presentCount >= 4);
@@ -223,9 +231,6 @@ function buildTaskRecord(task, state) {
   const explicitBlocked = sop.blockedSignal;
   const needsUser = explicitBlocked && sop.userNeedsSignal;
   const stale = (pBucket === 'high' && ageHours >= STALE_HIGH_HOURS) || ageHours >= STALE_NORMAL_HOURS;
-
-  const route = routingTarget(task);
-  const routeConf = routeConfidence(task, route);
 
   return {
     ...task,
@@ -242,9 +247,7 @@ function buildTaskRecord(task, state) {
     needs_user_blocker: needsUser,
     is_stale: stale,
     is_doc_incomplete: !sopOk,
-    high_risk: highRisk,
-    route_target: route,
-    route_confidence: routeConf,
+    high_risk: highRisk && !normalizedTags.has('approved-for-dispatch'),
     independent: hasExplicitIndependence(task),
     grandfathered,
   };
@@ -254,6 +257,7 @@ function deterministicRank(a, b) {
   return (
     (b.priority_score - a.priority_score) ||
     (Number(b.is_stale) - Number(a.is_stale)) ||
+    (Number(!a.is_doc_incomplete) - Number(!b.is_doc_incomplete)) ||
     (b.sop_present_count - a.sop_present_count) ||
     (b.age_hours - a.age_hours)
   );
@@ -325,20 +329,38 @@ function openDbReadOnly() {
   return new Database(DB_PATH, { readonly: true, fileMustExist: true });
 }
 
+function tableHasColumn(db, table, column) {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all();
+  return rows.some((r) => r.name === column);
+}
+
 function fetchKanbanFromSqlite() {
   const db = openDbReadOnly();
   try {
+    const hasWorkflowState = tableHasColumn(db, 'kanban_tasks', 'workflow_state');
+
+    // Anti-Idle v5: tasks already inside the chain (workflow_state IS NOT NULL)
+    // are excluded — they belong to Main / domain expert / builder, not the
+    // dispatcher. Pre-migration DBs (no workflow_state column) fall through to
+    // the old behaviour and surface every todo.
+    const workflowFilter = hasWorkflowState ? 'AND workflow_state IS NULL' : '';
+    const selectCols = hasWorkflowState
+      ? `id, title, description, priority, tags, column_id, notes,
+         created_at, updated_at, created_by,
+         workflow_state, workflow_owner, workflow_correlation_id,
+         workflow_attempt, workflow_updated_at`
+      : `id, title, description, priority, tags, column_id, notes,
+         created_at, updated_at, created_by`;
+
     // Normalize column_id: `in_progress` legacy → `inprogress`
     const todo = db.prepare(`
-      SELECT id, title, description, priority, tags, column_id, notes,
-             created_at, updated_at, created_by
+      SELECT ${selectCols}
       FROM kanban_tasks
-      WHERE column_id = 'todo'
+      WHERE column_id = 'todo' ${workflowFilter}
       ORDER BY created_at DESC
     `).all();
     const inprogress = db.prepare(`
-      SELECT id, title, description, priority, tags, column_id, notes,
-             created_at, updated_at, created_by
+      SELECT ${selectCols}
       FROM kanban_tasks
       WHERE column_id IN ('inprogress', 'in_progress')
       ORDER BY created_at DESC
@@ -422,7 +444,6 @@ function publicTask(task) {
     title: task.title_clean,
     priority: task.priority_bucket,
     age_hours: task.age_hours,
-    route_target: task.route_target,
     independent: task.independent,
     classification: task.needs_user_blocker
       ? 'blocked_needs_user'
@@ -438,8 +459,12 @@ function publicTask(task) {
 
 function buildOutput(base) {
   return {
-    version: 2,
-    schema_version: 2,
+    // Anti-Idle v5: schema bump to 3 — `routing_targets` removed; selected
+    // tasks are triage candidates for Main, never pre-routed to a domain agent.
+    version: 3,
+    schema_version: 3,
+    dispatch_mode: 'triage_to_main',
+    triage_target: 'main',
     timestamp: isoNow(),
     dispatch_run_id: base.dispatch_run_id,
     status: base.status || 'healthy',
@@ -455,7 +480,7 @@ function buildOutput(base) {
     available_wip_slots: base.available_wip_slots ?? 0,
     selected_task_ids: base.selected_task_ids || [],
     selected_tasks: base.selected_tasks || [],
-    routing_targets: base.routing_targets || {},
+    triage_candidate_ids: base.triage_candidate_ids || [],
     blocker_summary: base.blocker_summary || null,
     fallback_used: Boolean(base.fallback_used),
     confidence: base.confidence ?? null,
@@ -530,10 +555,8 @@ async function main() {
 
     const executable = records.filter((t) => (
       !t.needs_user_blocker &&
-      !t.is_doc_incomplete &&
       !t.high_risk &&
-      !isQuarantined(state, t.id) &&
-      t.route_target !== 'coordinator_review'
+      !isQuarantined(state, t.id)
     ));
 
     const signature = buildSignature(records);
@@ -578,8 +601,6 @@ async function main() {
     }
 
     const selectedRecords = ranked.filter((c) => selectedTaskIds.includes(c.id));
-    const routingTargets = {};
-    for (const r of selectedRecords) routingTargets[r.id] = r.route_target;
 
     state.lastRunAt = isoNow();
     state.lastDispatchRunId = runId;
@@ -594,7 +615,7 @@ async function main() {
     audit.task_ids = selectedTaskIds;
     audit.candidate_count = ranked.length;
     audit.reason = selectedReason;
-    audit.routing_target = routingTargets;
+    audit.triage_target = 'main';
     audit.confidence = confidence;
 
     if (!DRY_RUN) {
@@ -621,11 +642,16 @@ async function main() {
         title: t.title_clean,
         priority: t.priority_bucket,
         age_hours: t.age_hours,
-        route_target: t.route_target,
+        is_blocked: Boolean(t.is_blocked),
+        is_stale: Boolean(t.is_stale),
+        is_doc_incomplete: Boolean(t.is_doc_incomplete),
+        tags: t.tags,
         independent: t.independent,
         prev_updated_at: t.updated_at,
+        description: String(t.description || ''),
+        blocker_summary: t.blocker_summary,
       })),
-      routing_targets: routingTargets,
+      triage_candidate_ids: selectedTaskIds,
       blocker_summary: blockerSummary,
       fallback_used: true, // no LLM selector; deterministic is the path
       confidence,
