@@ -2,11 +2,22 @@
 /**
  * Anti-Idle Orchestrator (claudeclaw port)
  *
- * Layer 2 of 2. Consumes dispatcher JSON, creates mission-cli tasks, and
- * reconciles completion against durable Kanban state.
+ * Layer 2 of 2. Consumes dispatcher JSON, creates `triage_idle_kanban` mission
+ * tasks for Main (Rudy), and reconciles completion against durable Kanban
+ * state.
  *
  * Ownership/session registry lives in the claudeclaw SQLite DB in a new table
  * `anti_idle_sessions` (auto-created on first run). No Supabase dependency.
+ *
+ * Anti-Idle v5 (May 2026, see docs/anti-idle-v5-spec.md):
+ *   - Every mission goes to `main`. Main triages, picks the domain expert,
+ *     and creates the next mission. The orchestrator never assigns to
+ *     builder/content/research/ops directly.
+ *   - Idempotent upsert: if a triage mission for a kanban_task_id is already
+ *     queued/running, or the task already has an active workflow_state, we
+ *     skip and just refresh the timestamp.
+ *   - Sets workflow_state='triage_requested' on the kanban row when a mission
+ *     is created. Column_id stays 'todo' until the chain completes.
  *
  * Conservative completion principle (from /clawd spec, 2026-04-05):
  *   A task is complete only when durable Kanban state says so — a mission-task
@@ -43,10 +54,25 @@ const STATE_DIR = `${ROOT_DIR}/store/anti-idle`;
 const EVENTS_PATH = `${STATE_DIR}/orchestrator-events.jsonl`;
 const LOCK_PATH = `${STATE_DIR}/orchestrator.lock`;
 
-const DISPATCHER_SUPPORTED_MAJOR = 2;
+const DISPATCHER_SUPPORTED_MAJOR = 3;
+const TRIAGE_TARGET_AGENT = 'main';
 const LOCK_STALE_MS = 8 * 60 * 1000;
 const LEASE_HOURS = 8;
 const GRACE_MINUTES = 15;
+// Active workflow states — a kanban task in any of these is already being
+// handled by Main / a domain expert / builder / QA, and must NOT be re-triaged.
+const ACTIVE_WORKFLOW_STATES = new Set([
+  'triage_requested',
+  'triaged',
+  'planning',
+  'review_requested',
+  'review_passed',
+  'review_conditional',
+  'review_failed',
+  'build_requested',
+  'building',
+  'verification_requested',
+]);
 const DRY_RUN = process.env.ANTI_IDLE_DRY_RUN === '1' || process.env.ANTI_IDLE_ORCH_DRY_RUN === '1';
 const NOTIFY_DISABLED = process.env.ANTI_IDLE_NOTIFY_DISABLED === '1' || process.env.ANTI_IDLE_DISCORD_DISABLED === '1';
 const KANBAN_SOURCE = (process.env.ANTI_IDLE_KANBAN_SOURCE || 'sqlite').toLowerCase();
@@ -216,18 +242,21 @@ function validateDispatcher(dispatch, db) {
   const slots = Number(dispatch.available_wip_slots ?? 0);
   if (decision === 'dispatch' && selected.length > slots) errors.push('selected_exceeds_wip_slots');
 
-  const routes = dispatch.routing_targets || {};
-  for (const id of selected) if (!routes[id]) errors.push(`missing_route_target:${id}`);
+  // Anti-Idle v5: dispatcher MUST target Main only.
+  const triageTarget = String(dispatch.triage_target || '').toLowerCase();
+  if (decision === 'dispatch' && triageTarget !== TRIAGE_TARGET_AGENT) {
+    errors.push(`triage_target_invalid:${triageTarget || 'missing'}`);
+  }
 
   if (decision === 'dispatch' && dispatch.dispatch_run_id) {
     const existing = db.prepare(`SELECT 1 FROM anti_idle_sessions WHERE dispatch_run_id = ? AND status = 'running' LIMIT 1`).get(dispatch.dispatch_run_id);
     if (existing) errors.push('dispatch_run_already_active');
   }
 
-  return { ok: errors.length === 0, errors, schemaVersion, decision, selected, routes };
+  return { ok: errors.length === 0, errors, schemaVersion, decision, selected };
 }
 
-// ── Kanban atomic claim + fetch ───────────────────────────────────
+// ── Kanban fetch + workflow_state stamp ───────────────────────────
 function fetchKanbanRow(db, taskId) {
   if (KANBAN_SOURCE === 'supabase') {
     // Reconcile via SQLite mirror only; Supabase reconcile not implemented in v1.
@@ -236,76 +265,78 @@ function fetchKanbanRow(db, taskId) {
   return db.prepare('SELECT * FROM kanban_tasks WHERE id = ?').get(taskId);
 }
 
-function atomicClaimKanban(db, taskRow, dispatchRunId, reason, routingTarget) {
-  // Claim: todo → inprogress, append dispatch marker to notes,
-  // guard on prev updated_at to detect concurrent moves.
-  const marker = JSON.stringify({
-    dispatch_run_id: dispatchRunId,
-    ts: nowIso(),
-    reason: String(reason || '').slice(0, 200),
-    route_target: routingTarget,
-  });
-  const notesNew = taskRow.notes ? `${taskRow.notes}\nAUTO_DISPATCH: ${marker}` : `AUTO_DISPATCH: ${marker}`;
+function tableHasColumn(db, table, column) {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all();
+  return rows.some((r) => r.name === column);
+}
+
+// Anti-Idle v5: stamp workflow_state on the kanban row, guarded by a CAS on
+// the prior workflow_state (NULL or terminal) to prevent racing with another
+// dispatcher run. Column_id stays at 'todo' — the v5 chain runs alongside
+// the kanban column, not by flipping it.
+function stampTriageWorkflow(db, taskRow, correlationId) {
   const updatedAtNew = nowUnix();
+  const marker = JSON.stringify({
+    workflow_state: 'triage_requested',
+    correlation_id: correlationId,
+    ts: nowIso(),
+  });
+  const notesNew = taskRow.notes ? `${taskRow.notes}\nANTI_IDLE_V5: ${marker}` : `ANTI_IDLE_V5: ${marker}`;
   const res = db.prepare(`
     UPDATE kanban_tasks
-       SET column_id = 'inprogress',
+       SET workflow_state = 'triage_requested',
+           workflow_owner = 'main',
+           workflow_correlation_id = ?,
+           workflow_updated_at = ?,
            notes = ?,
            updated_at = ?
      WHERE id = ?
        AND column_id = 'todo'
+       AND (workflow_state IS NULL OR workflow_state IN ('builder_rejected', 'externally_blocked'))
        AND updated_at = ?
-  `).run(notesNew, updatedAtNew, taskRow.id, taskRow.updated_at);
-  return { ok: res.changes === 1, updatedAtNew, notesNew };
+  `).run(correlationId, updatedAtNew, notesNew, updatedAtNew, taskRow.id, taskRow.updated_at);
+  return { ok: res.changes === 1, updatedAtNew };
 }
 
 // ── Mission task creation ─────────────────────────────────────────
-function agentForRoute(target) {
-  const t = String(target || '').toLowerCase();
-  if (['builder', 'content', 'research', 'ops'].includes(t)) return t;
-  return null;
+function correlationIdFor(taskId) {
+  const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  return `idle_${taskId}_${date}`;
 }
 
-function buildMissionPrompt(task, dispatch, routingTarget, dispatchRunId) {
+function buildTriagePrompt(task, dispatch, dispatchRunId, correlationId) {
   const title = String(task.title || 'Untitled task').trim();
   const description = String(task.description || task.notes || '');
 
-  const extract = (labels) => {
-    for (const label of labels) {
-      const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const m = description.match(new RegExp(`(?:^|\\n)\\s*${escaped}\\s*:\\s*([^\\n]+)`, 'i'));
-      if (m?.[1]) return m[1].trim();
-    }
-    return '';
-  };
-
-  const why = extract(['WHY', 'REASON']) || '(not provided)';
-  const objective = extract(['OBJECTIVE', 'GOAL']) || '(not provided)';
-  const outcome = extract(['DESIRED OUTCOME', 'OUTCOME', 'SUCCESS CRITERIA']) || '(not provided)';
-  const blocker = extract(['BLOCKER', 'BLOCKED BY']) || 'none';
-  const nextStep = extract(['NEXT STEP', 'NEXT ACTION']) || '(not provided)';
-
   return [
-    `ANTI-IDLE DISPATCH → ${routingTarget.toUpperCase()}`,
+    `ANTI-IDLE TRIAGE → MAIN`,
     `kanban_task_id: ${task.id}`,
     `dispatch_run_id: ${dispatchRunId}`,
-    `routing_reason: ${dispatch.reason_code || 'kanban_dispatch'}`,
+    `workflow_correlation_id: ${correlationId}`,
+    `triage_reason: ${dispatch.reason_code || 'idle_kanban_task'}`,
+    `priority: ${task.priority || 'medium'}`,
+    `tags: ${(task.tags || '').toString().slice(0, 200)}`,
+    `column_id: ${task.column_id || 'todo'}`,
+    `is_blocked: ${task.column_id === 'blocked' ? 'yes' : 'no'}`,
     '',
     `Title: ${title}`,
-    `WHY: ${why}`,
-    `OBJECTIVE: ${objective}`,
-    `DESIRED OUTCOME: ${outcome}`,
-    `BLOCKER: ${blocker}`,
-    `NEXT STEP: ${nextStep}`,
     '',
-    'COMPLETION PROTOCOL (conservative-completion principle):',
-    '  1. Execute the task per NEXT STEP.',
-    '  2. When done, update kanban_tasks.column_id = "done" AND append',
-    `     "dispatch_run_id=${dispatchRunId}" to notes. That is the authoritative`,
-    '     completion signal.',
-    '  3. If blocked, move to column_id="blocked" with reason in notes.',
-    '  4. Do NOT claim success from chat output alone — the orchestrator',
-    '     reconciles against durable Kanban state on its next run.',
+    'TRIAGE PROTOCOL (Anti-Idle v5 — see docs/anti-idle-v5-spec.md):',
+    '  1. Read the kanban task fully (title, description, notes, tags).',
+    '  2. Decide whether the task is genuinely actionable or should move to',
+    '     workflow_state="externally_blocked" (waiting on a human/external).',
+    '  3. If actionable, pick the primary domain expert based on context',
+    '     (research / comms / content / ops). Builder is NEVER the first owner —',
+    '     they only execute Codex-approved plans.',
+    '  4. Create the next mission to that domain expert with full context and',
+    '     the instruction: "Create a plan, run Codex adversarial review, then',
+    '     delegate to builder."',
+    '  5. Update the kanban row:',
+    `       UPDATE kanban_tasks SET workflow_state='triaged', workflow_owner='<expert>', workflow_updated_at=<now> WHERE id='${task.id}';`,
+    '  6. If ambiguous, ask Aditya for clarification before assigning.',
+    '',
+    'Do NOT execute the task yourself. You are the chief of staff: triage and',
+    'delegate. Builder/content/research/comms/ops do the actual work.',
     '',
     'Original description follows:',
     '---',
@@ -319,6 +350,20 @@ function createMissionTaskRow(db, { missionId, title, prompt, agent, priority = 
     INSERT INTO mission_tasks (id, title, prompt, assigned_agent, status, created_by, priority, created_at)
     VALUES (?, ?, ?, ?, 'queued', 'anti-idle-orchestrator', ?, ?)
   `).run(missionId, title, prompt, agent, priority, now);
+}
+
+// Anti-Idle v5 dedup: an active triage mission is one that's queued or
+// running and references this kanban_task_id in its prompt. Belt + suspenders
+// alongside the workflow_state guard on the kanban row.
+function findActiveTriageMission(db, taskId) {
+  return db.prepare(`
+    SELECT id, status FROM mission_tasks
+     WHERE assigned_agent = ?
+       AND status IN ('queued', 'running')
+       AND prompt LIKE ?
+     ORDER BY created_at DESC
+     LIMIT 1
+  `).get(TRIAGE_TARGET_AGENT, `%kanban_task_id: ${taskId}%`);
 }
 
 // ── Reconciliation: conservative completion ───────────────────────
@@ -347,11 +392,35 @@ function reconcileSessions(db, orchestratorInstanceId) {
       continue;
     }
 
+    // Anti-Idle v5: a task in any active workflow_state is in flight even if
+    // column_id is still 'todo'. Heartbeat the session and move on.
+    const wfState = String(row.workflow_state || '').trim();
+    if (wfState && ACTIVE_WORKFLOW_STATES.has(wfState)) {
+      const hb = nowUnix();
+      heartbeatStmt.run(hb, hb + LEASE_HOURS * 3600, s.session_key);
+      continue;
+    }
+
     const next = mapColumnToState(row.column_id);
     if (next === 'inprogress') {
       // Keep lease alive
       const hb = nowUnix();
       heartbeatStmt.run(hb, hb + LEASE_HOURS * 3600, s.session_key);
+      continue;
+    }
+
+    // Anti-Idle v5 terminal markers from workflow_state.
+    if (wfState === 'externally_blocked' && validateTransition(s.status, 'blocked')) {
+      transitionStmt.run('blocked', 'workflow_externally_blocked', null, nowUnix(), s.session_key);
+      summary.blocked += 1;
+      summary.reconciled += 1;
+      continue;
+    }
+    if (wfState === 'done' && validateTransition(s.status, 'completed')) {
+      const corrId = s.completion_correlation_id || `${s.dispatch_run_id}:${s.task_id}`;
+      transitionStmt.run('completed', null, corrId, nowUnix(), s.session_key);
+      summary.completed += 1;
+      summary.reconciled += 1;
       continue;
     }
 
@@ -459,7 +528,7 @@ async function main() {
   let db;
 
   const event = {
-    schema_version: 1,
+    schema_version: 2,
     timestamp: startedAt,
     event_id: eventId('orchestrator'),
     orchestrator_instance_id: orchestratorInstanceId,
@@ -467,7 +536,7 @@ async function main() {
     dispatch_run_id: null,
     decision: 'silent',
     task_ids: [],
-    routing_targets: {},
+    triage_target: TRIAGE_TARGET_AGENT,
     mission_tasks: {},
     spawn_result: {},
     reconcile_summary: null,
@@ -525,21 +594,16 @@ async function main() {
       return;
     }
 
-    // 3. decision = dispatch — create mission tasks
+    // 3. decision = dispatch — create triage missions to Main (Anti-Idle v5)
     const selectedIds = validation.selected;
-    const routes = validation.routes;
     const spawnResults = [];
+    const hasWorkflowState = tableHasColumn(db, 'kanban_tasks', 'workflow_state');
 
     for (const taskId of selectedIds) {
-      const route = routes[taskId];
-      const agent = agentForRoute(route);
-      if (!agent) {
-        spawnResults.push({ task_id: taskId, ok: false, reason: 'unsupported_route', route });
-        continue;
-      }
-
-      // Skip if task already owned by a running session
-      const active = db.prepare(`SELECT session_key FROM anti_idle_sessions WHERE task_id = ? AND status = 'running' LIMIT 1`).get(taskId);
+      // Skip if task already owned by a running anti-idle session
+      const active = db.prepare(
+        `SELECT session_key FROM anti_idle_sessions WHERE task_id = ? AND status = 'running' LIMIT 1`
+      ).get(taskId);
       if (active) {
         spawnResults.push({ task_id: taskId, ok: false, skipped: true, reason: 'active_owner_exists' });
         continue;
@@ -556,37 +620,67 @@ async function main() {
         continue;
       }
 
-      // Wrap claim + mission + session in a transaction
+      // Anti-Idle v5 dedup gate: skip if the task is already inside the chain.
+      if (hasWorkflowState && row.workflow_state && ACTIVE_WORKFLOW_STATES.has(row.workflow_state)) {
+        spawnResults.push({
+          task_id: taskId, ok: false, skipped: true,
+          reason: `workflow_active:${row.workflow_state}`,
+        });
+        continue;
+      }
+
+      // Anti-Idle v5 dedup gate: skip if a triage mission is already queued/running.
+      const existingMission = findActiveTriageMission(db, taskId);
+      if (existingMission) {
+        spawnResults.push({
+          task_id: taskId, ok: false, skipped: true,
+          reason: `triage_mission_active:${existingMission.status}:${existingMission.id}`,
+        });
+        continue;
+      }
+
+      const correlationId = correlationIdFor(taskId);
       const missionId = crypto.randomBytes(4).toString('hex');
       const sessionKey = `session_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-      const prompt = buildMissionPrompt(row, dispatch, route, dispatch.dispatch_run_id);
-      const title = `[anti-idle] ${String(row.title || '').slice(0, 80)}`;
+      const prompt = buildTriagePrompt(row, dispatch, dispatch.dispatch_run_id, correlationId);
+      const title = `[triage] ${String(row.title || '').slice(0, 80)}`;
 
       if (DRY_RUN) {
         spawnResults.push({
           task_id: taskId, ok: true, dry_run: true,
-          route, mission_task_id: `dryrun-${missionId}`, session_key: `dryrun-${sessionKey}`,
+          agent: TRIAGE_TARGET_AGENT,
+          mission_task_id: `dryrun-${missionId}`,
+          session_key: `dryrun-${sessionKey}`,
+          correlation_id: correlationId,
         });
         continue;
       }
 
       const txn = db.transaction(() => {
-        const claim = atomicClaimKanban(db, row, dispatch.dispatch_run_id, dispatch.reason_code || 'anti_idle_dispatch', route);
-        if (!claim.ok) return { ok: false, reason: 'claim_conflict' };
+        if (hasWorkflowState) {
+          const stamp = stampTriageWorkflow(db, row, correlationId);
+          if (!stamp.ok) return { ok: false, reason: 'workflow_stamp_conflict' };
+        }
 
-        createMissionTaskRow(db, { missionId, title, prompt, agent, priority: 5 });
+        createMissionTaskRow(db, {
+          missionId,
+          title,
+          prompt,
+          agent: TRIAGE_TARGET_AGENT,
+          priority: 5,
+        });
 
         const now = nowUnix();
         db.prepare(`
           INSERT INTO anti_idle_sessions
             (session_key, dispatch_run_id, task_id, mission_task_id, routing_target,
              orchestrator_instance_id, status, started_at, last_heartbeat_at, lease_expires_at,
-             kanban_prev_updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)
+             kanban_prev_updated_at, completion_correlation_id)
+          VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)
         `).run(
-          sessionKey, dispatch.dispatch_run_id, taskId, missionId, route,
+          sessionKey, dispatch.dispatch_run_id, taskId, missionId, TRIAGE_TARGET_AGENT,
           orchestratorInstanceId, now, now, now + LEASE_HOURS * 3600,
-          String(row.updated_at ?? '')
+          String(row.updated_at ?? ''), correlationId
         );
         return { ok: true };
       });
@@ -596,12 +690,18 @@ async function main() {
         spawnResults.push({ task_id: taskId, ok: false, reason: result.reason });
         continue;
       }
-      spawnResults.push({ task_id: taskId, ok: true, route, mission_task_id: missionId, session_key: sessionKey });
+      spawnResults.push({
+        task_id: taskId, ok: true,
+        agent: TRIAGE_TARGET_AGENT,
+        mission_task_id: missionId,
+        session_key: sessionKey,
+        correlation_id: correlationId,
+      });
       event.mission_tasks[taskId] = missionId;
     }
 
     event.task_ids = selectedIds;
-    event.routing_targets = routes;
+    event.triage_target = TRIAGE_TARGET_AGENT;
     event.spawn_result = { results: spawnResults };
 
     await appendJsonl(EVENTS_PATH, event);
@@ -610,14 +710,9 @@ async function main() {
     const successes = spawnResults.filter((r) => r.ok);
     const reconciled = event.reconcile_summary?.reconciled ?? 0;
     if (successes.length > 0) {
-      const pieces = successes.map((r) => {
-        const row = fetchKanbanRow(db, r.task_id);
-        const title = (row?.title || r.task_id).slice(0, 50);
-        return `${r.route}:${r.mission_task_id} "${title}"`;
-      });
       const summary = DRY_RUN
-        ? `🧪 [dry-run] would dispatch: ${pieces.join(' | ')}`
-        : `🤖 dispatched ${successes.length}: ${pieces.join(' | ')}`;
+        ? `🧪 [dry-run] ${successes.length} idle task(s) would queue for Main triage`
+        : `🤖 ${successes.length} idle task(s) queued for Main triage`;
       console.log(summary);
       const posted = await postNotify(summary, {
         category: 'anti_idle_summary',
@@ -625,23 +720,19 @@ async function main() {
           kanbanTasksReconciled: reconciled,
           missionsDispatched: successes.length,
           dispatchRunId: dispatch.dispatch_run_id || null,
+          triageTarget: TRIAGE_TARGET_AGENT,
+          taskIds: successes.map((r) => r.task_id),
           dryRun: DRY_RUN,
         },
       });
       if (!posted.ok && !posted.skipped) console.error('[anti-idle] Telegram post failed:', posted.reason);
-    } else {
+    } else if (selectedIds.length > 0) {
       const reasons = spawnResults.map((r) => `${r.task_id}:${r.reason}`).join(', ');
-      const summary = `ANTI-IDLE BLOCKED — no dispatch succeeded (${reasons || 'n/a'})`;
+      const summary = `ANTI-IDLE: nothing dispatched — all ${selectedIds.length} candidate(s) deduped (${reasons || 'n/a'})`;
       console.log(summary);
-      await postNotify(`⚠️ ${summary}`, {
-        category: 'error',
-        meta: {
-          kanbanTasksReconciled: reconciled,
-          missionsDispatched: 0,
-          dispatchRunId: dispatch.dispatch_run_id || null,
-          reasons: spawnResults.map((r) => ({ task_id: r.task_id, reason: r.reason })),
-        },
-      });
+      // Dedup is the happy path under v5, not an error. Stay silent on Telegram.
+    } else {
+      console.log('ANTI-IDLE: no candidates from dispatcher');
     }
   } catch (error) {
     event.error = String(error?.message || error);

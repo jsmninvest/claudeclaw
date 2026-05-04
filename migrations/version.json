@@ -10,6 +10,11 @@
     "v1.7.1": ["add-mission-timeout-ms"],
     "v1.7.2": ["add-mission-autopushed-at"],
     "v1.7.3": ["add-mission-retry-columns"],
-    "v1.8.0": ["add-per-task-max-turns"]
+    "v1.8.0": ["add-per-task-max-turns"],
+    "v1.9.0": ["add-unsubscribe-tables"],
+    "v1.10.0": ["add-obsidian-sync-state"],
+    "v1.11.0": ["add-obsidian-watcher-tables"],
+    "v1.12.0": ["add-probe-state"],
+    "v1.13.0": ["add-anti-idle-workflow-state"]
   }
 }
